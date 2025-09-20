@@ -5,10 +5,14 @@ import pandas as pd
 import cv2, io, time
 from math import sqrt
 
-# pour capter les clics sur l'image (aucun canvas fragile)
-from streamlit_image_coordinates import streamlit_image_coordinates
+# === clics sur image (robuste Cloud) ===
+try:
+    from streamlit_image_coordinates import streamlit_image_coordinates
+except Exception:
+    streamlit_image_coordinates = None  # on avertira plus bas
 
-# ================= Utils génériques =================
+
+# ================= Utils =================
 def pil_to_cv(img_pil):
     return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
@@ -23,7 +27,7 @@ def overlay_points(image_pil, points, color=(0,255,0), radius=5):
 
 def overlay_points_colored(image_pil, points, confirmed_ids=set(), rejected_ids=set(),
                            radius=6):
-    """Colorer les points: vert=confirmé, rouge=rejeté, gris=autres."""
+    """vert=confirmé, rouge=rejeté, gris=autres."""
     img = pil_to_cv(image_pil.copy())
     for i,(x,y) in enumerate(points):
         if i in confirmed_ids:  col = (0,255,0)
@@ -78,7 +82,8 @@ def nearest_index(points, qx, qy):
             dmin, kmin = d, k
     return kmin, dmin**0.5
 
-# ============ Segmentation “guidée” par confirmations/rejets ============
+
+# === Segmentation guidée par confirmations/rejets (Lab + Mahalanobis) ===
 def sample_disc_pixels(lab_img, cx, cy, r=8):
     H,W,_ = lab_img.shape
     x0, x1 = max(0, int(cx-r)), min(W, int(cx+r)+1)
@@ -90,8 +95,7 @@ def sample_disc_pixels(lab_img, cx, cy, r=8):
 def fit_gaussian(pixels):
     mu = pixels.mean(axis=0)
     cov = np.cov(pixels.T)
-    # stabilisation num.
-    cov = cov + 1e-6*np.eye(3)
+    cov = cov + 1e-6*np.eye(3)  # stabilisation
     inv = np.linalg.inv(cov)
     return mu, inv
 
@@ -101,7 +105,6 @@ def maha_batch(X, mu, inv):
 
 def segment_from_hints(img_bgr, pos_pts, neg_pts, r=8, thr_factor=3.0, pos_bias=1.0,
                        open_k=3, close_k=3):
-    """Classif couleur Lab par Mahalanobis (guidée par clics)."""
     H,W = img_bgr.shape[:2]
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
 
@@ -116,7 +119,6 @@ def segment_from_hints(img_bgr, pos_pts, neg_pts, r=8, thr_factor=3.0, pos_bias=
     neg_pix = np.concatenate(neg_pix) if neg_pix else np.empty((0,3), np.float32)
 
     if len(pos_pix) < 30:
-        # pas assez de confirmations
         return np.zeros((H,W), np.uint8)
 
     mu_pos, inv_pos = fit_gaussian(pos_pix)
@@ -128,15 +130,15 @@ def segment_from_hints(img_bgr, pos_pts, neg_pts, r=8, thr_factor=3.0, pos_bias=
         dneg = maha_batch(flat, mu_neg, inv_neg)
         pred = (dpos < pos_bias * dneg)
     else:
-        # Seuillage relatif sur dpos si pas de négatifs
         dpos_pos = maha_batch(pos_pix, mu_pos, inv_pos)
-        thr = thr_factor * np.median(dpos_pos)  # robuste
+        thr = thr_factor * np.median(dpos_pos)
         pred = (dpos < thr)
 
     mask = (pred.reshape(H,W) * 255).astype(np.uint8)
     mask = morph_cleanup(mask, open_k=open_k, close_k=close_k)
     return mask
 
+# === Watershed pour séparer les objets collés ===
 def split_touching_watershed(bw):
     # bw 0/255, objets = 255
     dist = cv2.distanceTransform(bw, cv2.DIST_L2, 5)
@@ -164,7 +166,8 @@ def centroids_from_markers(markers, min_area=80, max_area=50000):
             pts.append((cx, cy))
     return pts
 
-# =================== App ===================
+
+# ================= App =================
 st.set_page_config(page_title="Comptage — validation guidée", layout="wide")
 st.title("🧮 Comptage avec validation guidée (confirmer/rejeter → recomptage)")
 
@@ -194,11 +197,16 @@ with st.sidebar:
 
 up = st.file_uploader("Déposer une image (JPG/PNG)", type=["jpg","jpeg","png"])
 if not up:
-    st.info("1) Détection initiale → 2) Validation (confirmer/rejeter 5–10 pts) → 3) Recompter.")
+    st.info("1) Détection initiale → 2) Valider (confirmer 5–6 bons, rejeter 4–5 mauvais) → 3) Recompter → 4) Corrections fines → Export.")
     st.stop()
 
 img = Image.open(up).convert("RGB")
 st.image(img, use_column_width=True, caption="Image d’entrée")
+
+if streamlit_image_coordinates is None:
+    st.error("Le module `streamlit-image-coordinates` est manquant. "
+             "Ajoute-le à `requirements.txt` puis redeploie : `streamlit-image-coordinates==0.1.5`.")
+    st.stop()
 
 # ===== 1) Détection initiale =====
 if st.button("🚀 Détection initiale", type="primary"):
@@ -230,19 +238,20 @@ if st.button("🚀 Détection initiale", type="primary"):
     base_points = [(c["cx"], c["cy"]) for c in comps
                    if (min_area <= c["area"] <= max_area)]
 
+    # état
     st.session_state["base_img"] = img
     st.session_state["bw_init"] = bw
     st.session_state["comps_init"] = comps
     st.session_state["points_init"] = base_points
     st.session_state["confirmed_ids"] = set()
     st.session_state["rejected_ids"]  = set()
-    st.session_state["points_final"]  = base_points[:]  # pour corrections ultérieures
+    st.session_state["points_final"]  = base_points[:]  # sera mis à jour après recomptage
 
     st.success(f"Détection initiale: {len(base_points)} points • {(time.time()-t0)*1000:.0f} ms")
     st.image(overlay_points(img, base_points, (0,255,0), 6),
              use_column_width=True, caption="Overlay (détection initiale)")
 
-# ===== 2) Validation guidée (confirmer / rejeter) =====
+# ===== 2) Validation guidée =====
 if "points_init" in st.session_state:
     st.subheader("Validation guidée")
     mode = st.radio("Action sur clic", ["Confirmer un bon point", "Rejeter un point erroné"], horizontal=True)
@@ -280,7 +289,7 @@ if "points_init" in st.session_state:
             pos_pts = [pts_all[i] for i in sorted(st.session_state["confirmed_ids"])]
             neg_pts = [pts_all[i] for i in sorted(st.session_state["rejected_ids"])]
 
-            # Apprendre couleur + segmenter
+            # Apprentissage couleur + segmentation
             mask_guided = segment_from_hints(
                 pil_to_cv(st.session_state["base_img"]),
                 pos_pts, neg_pts,
@@ -288,43 +297,26 @@ if "points_init" in st.session_state:
                 open_k=open_k, close_k=close_k
             )
 
-            # Optionnel : séparer les objets collés
+            # Adapter min/max area à partir des CONFIRMÉS (si dispo)
+            areas_confirmed = []
+            comps0 = st.session_state["comps_init"]
+            for i in st.session_state["confirmed_ids"]:
+                if i < len(comps0):
+                    areas_confirmed.append(comps0[i]["area"])
+            if len(areas_confirmed) >= 3:
+                q10 = np.percentile(areas_confirmed, 10)
+                q90 = np.percentile(areas_confirmed, 90)
+                minA = max(10, int(0.7*q10))
+                maxA = int(1.6*q90)
+            else:
+                minA, maxA = min_area, max_area
+
+            # Séparation optionnelle des amas
             if use_watershed:
                 markers = split_touching_watershed(mask_guided)
-                # Adapter min/max area à partir des CONFIRMÉS (si dispo)
-                # -> récupérer aire des composantes proches des confirmés dans la détection initiale
-                areas_confirmed = []
-                comps0 = st.session_state["comps_init"]
-                for i in st.session_state["confirmed_ids"]:
-                    # aire “initiale” comme proxy
-                    # si besoin, on peut aussi recalculer par markers autour de ces centres
-                    if i < len(comps0):
-                        areas_confirmed.append(comps0[i]["area"])
-                if len(areas_confirmed) >= 3:
-                    q10 = np.percentile(areas_confirmed, 10)
-                    q90 = np.percentile(areas_confirmed, 90)
-                    minA = max(10, int(0.7*q10))
-                    maxA = int(1.6*q90)
-                else:
-                    minA, maxA = min_area, max_area
-
                 pts = centroids_from_markers(markers, minA, maxA)
             else:
-                # simple connectedComponents sur le masque guidé
                 compsG, _, _ = connected_components(mask_guided)
-                # adapter min/max si confirmés dispo
-                areas_confirmed = []
-                comps0 = st.session_state["comps_init"]
-                for i in st.session_state["confirmed_ids"]:
-                    if i < len(comps0):
-                        areas_confirmed.append(comps0[i]["area"])
-                if len(areas_confirmed) >= 3:
-                    q10 = np.percentile(areas_confirmed, 10)
-                    q90 = np.percentile(areas_confirmed, 90)
-                    minA = max(10, int(0.7*q10))
-                    maxA = int(1.6*q90))
-                else:
-                    minA, maxA = min_area, max_area
                 pts = [(c["cx"], c["cy"]) for c in compsG if minA <= c["area"] <= maxA]
 
             st.session_state["points_final"] = pts
@@ -332,7 +324,7 @@ if "points_init" in st.session_state:
             st.image(overlay_points(st.session_state["base_img"], pts, (0,255,0), 6),
                      use_column_width=True, caption="Overlay (recomptage guidé)")
 
-# ===== 4) Corrections fines puis Export =====
+# ===== 4) Corrections fines & Export =====
 if "points_final" in st.session_state:
     st.subheader("Corrections fines (clic)")
     mode2 = st.radio("Action", ["Supprimer", "Ajouter"], horizontal=True, key="corrmode")
