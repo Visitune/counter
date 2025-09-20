@@ -2,11 +2,17 @@ import streamlit as st
 from PIL import Image
 import numpy as np
 import pandas as pd
-import cv2
-import io
+import cv2, io, time
 from pathlib import Path
 
-# -------------- Utils --------------
+# NEW: pour capter les clics sur l'image
+try:
+    from streamlit_image_coordinates import streamlit_image_coordinates
+    HAS_CLICK = True
+except Exception:
+    HAS_CLICK = False
+
+# ============== Utils ==============
 def pil_to_cv(img_pil):
     return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
@@ -33,7 +39,6 @@ def threshold_image(gray, method="otsu", invert=False, block_size=31, C=5):
             block_size|1, C
         )
     else:
-        # Otsu
         _, th = cv2.threshold(
             gray, 0, 255,
             (cv2.THRESH_BINARY_INV if not invert else cv2.THRESH_BINARY) | cv2.THRESH_OTSU
@@ -59,9 +64,19 @@ def count_components(mask, min_area, max_area):
             pts.append((float(cx), float(cy)))
     return pts
 
-# -------------- App --------------
-st.set_page_config(page_title="Comptage agrée — version de base (robuste Cloud)", layout="wide")
-st.title("🧮 Comptage d’agréage — base robuste (OpenCV pur)")
+def nearest_index(points, qx, qy):
+    if not points:
+        return None, 1e9
+    dmin, kmin = 1e9, None
+    for k,(x,y) in enumerate(points):
+        d = (x-qx)**2 + (y-qy)**2
+        if d < dmin:
+            dmin, kmin = d, k
+    return kmin, dmin**0.5
+
+# ============== App ==============
+st.set_page_config(page_title="Comptage agrée — base + correction par clic", layout="wide")
+st.title("🧮 Comptage d’agréage — base robuste + correction par clic")
 
 with st.sidebar:
     st.header("Paramètres de traitement")
@@ -85,7 +100,8 @@ with st.sidebar:
     max_area = st.slider("Aire max (px²)", 100, 300000, 30000, 500)
 
     st.markdown("---")
-    correction = st.number_input("Correction manuelle finale (+/-)", -9999, 9999, 0)
+    rm_radius = st.slider("Rayon sélection pour corrections (px)", 5, 60, 20, 1)
+    correction_typed = st.number_input("Correction manuelle finale (+/-)", -9999, 9999, 0)
 
 up = st.file_uploader("Dépose une image (JPG/PNG)", type=["jpg", "jpeg", "png"])
 if not up:
@@ -96,6 +112,7 @@ img = Image.open(up).convert("RGB")
 st.image(img, use_column_width=True, caption="Image d’entrée")
 
 if st.button("🚀 Lancer le comptage", type="primary"):
+    t0 = time.time()
     img_cv = pil_to_cv(img)
 
     # Sélection du canal
@@ -114,40 +131,75 @@ if st.button("🚀 Lancer le comptage", type="primary"):
         lab = cv2.cvtColor(img_cv, cv2.COLOR_BGR2LAB)
         gray = lab[:, :, 2]
 
-    # Amélioration du contraste (utile en agro)
     gray = equalize_if_needed(gray, use_clahe, clip=clahe_clip, tile=clahe_tile)
 
-    # Seuillage
     if th_method == "Adaptive":
         bw = threshold_image(gray, method="adaptive", invert=invert, block_size=block|1, C=C)
     else:
         bw = threshold_image(gray, method="otsu", invert=invert)
 
-    # Nettoyage morphologique
     bw = morph_cleanup(bw, open_k=open_k, close_k=close_k)
 
-    # Comptage
     points = count_components(bw, min_area=min_area, max_area=max_area)
     overlay = overlay_points(img, points, color=(0,255,0), radius=5)
 
     auto_count = len(points)
-    final_count = max(0, auto_count + int(correction))
+
+    # Mémoriser pour corrections
+    st.session_state["base_img"] = img
+    st.session_state["bw"] = bw
+    st.session_state["points"] = points[:]         # version courante (corrigeable)
+    st.session_state["auto_count"] = auto_count
 
     st.metric("Compte automatique", auto_count)
-    st.metric("Compte final (après correction)", final_count)
-
     c1, c2 = st.columns(2)
     with c1:
         st.image(overlay, use_column_width=True, caption="Overlay (points sur items)")
     with c2:
         st.image(bw, use_column_width=True, caption="Binaire utilisé (contrôle)")
+    st.caption(f"Temps de traitement ~ {(time.time()-t0)*1000:.0f} ms")
 
-    # Exports (image + CSV 1 ligne)
+# ====== Corrections par clic ======
+if "points" in st.session_state:
+    st.subheader("Corrections par clic")
+    if not HAS_CLICK:
+        st.warning("Module `streamlit-image-coordinates` non disponible. "
+                   "Ajoute-le à requirements.txt puis redeploie : `streamlit-image-coordinates`.")
+    else:
+        mode = st.radio("Action", ["Supprimer un point", "Ajouter un point"], horizontal=True)
+        # image interactive (on redessine à chaque clic)
+        current_overlay = overlay_points(st.session_state["base_img"], st.session_state["points"], (0,255,0), radius=6)
+        click = streamlit_image_coordinates(current_overlay, key="corr_click")
+
+        if click:
+            x, y = float(click["x"]), float(click["y"])
+            pts = list(st.session_state["points"])
+            if mode.startswith("Supprimer"):
+                idx, d = nearest_index(pts, x, y)
+                if idx is not None and d <= rm_radius and len(pts) > 0:
+                    pts.pop(idx)
+                    st.session_state["points"] = pts
+                    st.success(f"Point supprimé (d≈{d:.1f}px).")
+            else:
+                idx, d = nearest_index(pts, x, y)
+                if d > rm_radius:
+                    pts.append((x, y))
+                    st.session_state["points"] = pts
+                    st.success("Point ajouté.")
+
+        st.image(overlay_points(st.session_state["base_img"], st.session_state["points"], (0,255,0), 6),
+                 use_column_width=True, caption="Overlay après corrections")
+
+    # ===== Export final =====
     st.subheader("Export")
+    final_count = max(0, len(st.session_state["points"]) + int(correction_typed))
+    st.metric("Compte final (après corrections + correction manuelle)", final_count)
+
     buf = io.BytesIO()
-    overlay.save(buf, format="PNG")
+    overlay_final = overlay_points(st.session_state["base_img"], st.session_state["points"], (0,255,0), 6)
+    overlay_final.save(buf, format="PNG")
     st.download_button("⬇️ Image annotée (PNG)", data=buf.getvalue(),
-                       file_name=f"overlay_{produit}.png", mime="image/png")
+                       file_name=f"overlay_{st.session_state.get('produit','objet')}.png", mime="image/png")
 
     df = pd.DataFrame([{
         "produit": produit,
@@ -159,8 +211,9 @@ if st.button("🚀 Lancer le comptage", type="primary"):
         "close_k": int(close_k),
         "min_area": int(min_area),
         "max_area": int(max_area),
-        "compte_auto": int(auto_count),
-        "correction": int(correction),
+        "compte_auto": int(st.session_state["auto_count"]),
+        "compte_final_points": int(len(st.session_state["points"])),
+        "correction_typed": int(correction_typed),
         "compte_final": int(final_count)
     }])
     st.download_button("⬇️ Résumé (CSV)", data=df.to_csv(index=False).encode("utf-8"),
