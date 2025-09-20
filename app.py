@@ -3,16 +3,12 @@ from PIL import Image
 import numpy as np
 import pandas as pd
 import cv2, io, time
-from pathlib import Path
+from math import sqrt
 
-# NEW: pour capter les clics sur l'image
-try:
-    from streamlit_image_coordinates import streamlit_image_coordinates
-    HAS_CLICK = True
-except Exception:
-    HAS_CLICK = False
+# pour capter les clics sur l'image (aucun canvas fragile)
+from streamlit_image_coordinates import streamlit_image_coordinates
 
-# ============== Utils ==============
+# ================= Utils génériques =================
 def pil_to_cv(img_pil):
     return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
@@ -25,13 +21,23 @@ def overlay_points(image_pil, points, color=(0,255,0), radius=5):
         cv2.circle(img, (int(x),int(y)), radius, color, -1, lineType=cv2.LINE_AA)
     return cv_to_pil(img)
 
+def overlay_points_colored(image_pil, points, confirmed_ids=set(), rejected_ids=set(),
+                           radius=6):
+    """Colorer les points: vert=confirmé, rouge=rejeté, gris=autres."""
+    img = pil_to_cv(image_pil.copy())
+    for i,(x,y) in enumerate(points):
+        if i in confirmed_ids:  col = (0,255,0)
+        elif i in rejected_ids: col = (0,0,255)
+        else:                   col = (180,180,180)
+        cv2.circle(img, (int(x),int(y)), radius, col, -1, lineType=cv2.LINE_AA)
+    return cv_to_pil(img)
+
 def equalize_if_needed(gray, use_clahe, clip=3.0, tile=8):
-    if not use_clahe:
-        return gray
+    if not use_clahe: return gray
     clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(tile, tile))
     return clahe.apply(gray)
 
-def threshold_image(gray, method="otsu", invert=False, block_size=31, C=5):
+def threshold_image(gray, method="otsu", invert=False, block_size=41, C=5):
     if method == "adaptive":
         th = cv2.adaptiveThreshold(
             gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
@@ -54,19 +60,17 @@ def morph_cleanup(mask, open_k=3, close_k=3):
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
     return mask
 
-def count_components(mask, min_area, max_area):
+def connected_components(mask):
     num, labels, stats, cents = cv2.connectedComponentsWithStats(mask, 8)
-    pts = []
+    comps = []
     for i in range(1, num):
         area = stats[i, cv2.CC_STAT_AREA]
-        if min_area <= area <= max_area:
-            cx, cy = cents[i]
-            pts.append((float(cx), float(cy)))
-    return pts
+        cx, cy = cents[i]
+        comps.append(dict(idx=i, cx=float(cx), cy=float(cy), area=int(area)))
+    return comps, labels, stats
 
 def nearest_index(points, qx, qy):
-    if not points:
-        return None, 1e9
+    if not points: return None, 1e9
     dmin, kmin = 1e9, None
     for k,(x,y) in enumerate(points):
         d = (x-qx)**2 + (y-qy)**2
@@ -74,147 +78,301 @@ def nearest_index(points, qx, qy):
             dmin, kmin = d, k
     return kmin, dmin**0.5
 
-# ============== App ==============
-st.set_page_config(page_title="Comptage agrée — base + correction par clic", layout="wide")
-st.title("🧮 Comptage d’agréage — base robuste + correction par clic")
+# ============ Segmentation “guidée” par confirmations/rejets ============
+def sample_disc_pixels(lab_img, cx, cy, r=8):
+    H,W,_ = lab_img.shape
+    x0, x1 = max(0, int(cx-r)), min(W, int(cx+r)+1)
+    y0, y1 = max(0, int(cy-r)), min(H, int(cy+r)+1)
+    yy, xx = np.ogrid[y0:y1, x0:x1]
+    mask = (xx - cx)**2 + (yy - cy)**2 <= r*r
+    return lab_img[y0:y1, x0:x1][mask]
+
+def fit_gaussian(pixels):
+    mu = pixels.mean(axis=0)
+    cov = np.cov(pixels.T)
+    # stabilisation num.
+    cov = cov + 1e-6*np.eye(3)
+    inv = np.linalg.inv(cov)
+    return mu, inv
+
+def maha_batch(X, mu, inv):
+    Z = X - mu
+    return np.einsum('ij,jk,ik->i', Z, inv, Z, optimize=True)
+
+def segment_from_hints(img_bgr, pos_pts, neg_pts, r=8, thr_factor=3.0, pos_bias=1.0,
+                       open_k=3, close_k=3):
+    """Classif couleur Lab par Mahalanobis (guidée par clics)."""
+    H,W = img_bgr.shape[:2]
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+    pos_pix = []
+    for (x,y) in pos_pts:
+        pos_pix.append(sample_disc_pixels(lab, x, y, r))
+    pos_pix = np.concatenate(pos_pix) if pos_pix else np.empty((0,3), np.float32)
+
+    neg_pix = []
+    for (x,y) in neg_pts:
+        neg_pix.append(sample_disc_pixels(lab, x, y, r))
+    neg_pix = np.concatenate(neg_pix) if neg_pix else np.empty((0,3), np.float32)
+
+    if len(pos_pix) < 30:
+        # pas assez de confirmations
+        return np.zeros((H,W), np.uint8)
+
+    mu_pos, inv_pos = fit_gaussian(pos_pix)
+    flat = lab.reshape(-1,3)
+    dpos = maha_batch(flat, mu_pos, inv_pos)
+
+    if len(neg_pix) >= 30:
+        mu_neg, inv_neg = fit_gaussian(neg_pix)
+        dneg = maha_batch(flat, mu_neg, inv_neg)
+        pred = (dpos < pos_bias * dneg)
+    else:
+        # Seuillage relatif sur dpos si pas de négatifs
+        dpos_pos = maha_batch(pos_pix, mu_pos, inv_pos)
+        thr = thr_factor * np.median(dpos_pos)  # robuste
+        pred = (dpos < thr)
+
+    mask = (pred.reshape(H,W) * 255).astype(np.uint8)
+    mask = morph_cleanup(mask, open_k=open_k, close_k=close_k)
+    return mask
+
+def split_touching_watershed(bw):
+    # bw 0/255, objets = 255
+    dist = cv2.distanceTransform(bw, cv2.DIST_L2, 5)
+    _, sure_fg = cv2.threshold(dist, 0.45*dist.max(), 255, 0)
+    sure_fg = np.uint8(sure_fg)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(3,3))
+    sure_bg = cv2.dilate(bw, kernel, iterations=3)
+    unknown = cv2.subtract(sure_bg, sure_fg)
+    num_markers, markers = cv2.connectedComponents(sure_fg)
+    markers = markers + 1
+    markers[unknown==255] = 0
+    img3c = cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)
+    cv2.watershed(img3c, markers)
+    return markers  # int32
+
+def centroids_from_markers(markers, min_area=80, max_area=50000):
+    pts = []
+    for lab in np.unique(markers):
+        if lab <= 1:  # 0/1 = non-objets
+            continue
+        area = int((markers==lab).sum())
+        if min_area <= area <= max_area:
+            yx = np.argwhere(markers==lab).mean(axis=0)
+            cy, cx = float(yx[0]), float(yx[1])
+            pts.append((cx, cy))
+    return pts
+
+# =================== App ===================
+st.set_page_config(page_title="Comptage — validation guidée", layout="wide")
+st.title("🧮 Comptage avec validation guidée (confirmer/rejeter → recomptage)")
 
 with st.sidebar:
-    st.header("Paramètres de traitement")
+    st.header("Paramètres de base")
     produit = st.text_input("Produit (nom libre)", "objet")
-    canal = st.selectbox("Canal de travail",
-                         ["Gris (Y)", "HSV-S", "HSV-V", "Lab-a", "Lab-b"])
-    use_clahe = st.checkbox("CLAHE (améliorer contraste local)", value=True)
+    canal = st.selectbox("Canal initial", ["Gris (Y)", "HSV-S", "HSV-V", "Lab-a", "Lab-b"])
+    use_clahe = st.checkbox("CLAHE (contraste local)", True)
     clahe_clip = st.slider("CLAHE clipLimit", 1.0, 6.0, 3.0, 0.1)
     clahe_tile = st.slider("CLAHE tileGrid", 4, 16, 8, 1)
-
-    st.markdown("---")
-    th_method = st.selectbox("Méthode de seuillage", ["Otsu", "Adaptive"])
-    invert = st.checkbox("Inverser binaire (objets clairs)", value=True)
+    th_method = st.selectbox("Seuillage", ["Otsu", "Adaptive"])
+    invert = st.checkbox("Inverser binaire (objets clairs)", True)
     block = st.slider("Adaptive: bloc (impair)", 15, 101, 41, 2)
     C = st.slider("Adaptive: C", -15, 15, 5, 1)
-
-    st.markdown("---")
     open_k = st.slider("Ouverture (px)", 1, 15, 3, 1)
     close_k = st.slider("Fermeture (px)", 1, 15, 3, 1)
     min_area = st.slider("Aire min (px²)", 10, 20000, 120, 10)
     max_area = st.slider("Aire max (px²)", 100, 300000, 30000, 500)
 
     st.markdown("---")
-    rm_radius = st.slider("Rayon sélection pour corrections (px)", 5, 60, 20, 1)
-    correction_typed = st.number_input("Correction manuelle finale (+/-)", -9999, 9999, 0)
+    st.header("Validation guidée")
+    rm_radius = st.slider("Rayon de sélection (px)", 5, 60, 20, 1)
+    seed_radius = st.slider("Rayon échantillonnage couleur (px)", 4, 20, 8, 1)
+    thr_factor = st.slider("Seuil (si pas de négatifs)", 1.0, 6.0, 3.0, 0.1)
+    pos_bias   = st.slider("Biais pos/neg (si négatifs)", 0.5, 1.5, 1.0, 0.05)
+    use_watershed = st.checkbox("Séparer objets collés (watershed)", True)
 
-up = st.file_uploader("Dépose une image (JPG/PNG)", type=["jpg", "jpeg", "png"])
+up = st.file_uploader("Déposer une image (JPG/PNG)", type=["jpg","jpeg","png"])
 if not up:
-    st.info("Dépose une image ci-dessus, ajuste les sliders → **Lancer le comptage**.")
+    st.info("1) Détection initiale → 2) Validation (confirmer/rejeter 5–10 pts) → 3) Recompter.")
     st.stop()
 
 img = Image.open(up).convert("RGB")
 st.image(img, use_column_width=True, caption="Image d’entrée")
 
-if st.button("🚀 Lancer le comptage", type="primary"):
+# ===== 1) Détection initiale =====
+if st.button("🚀 Détection initiale", type="primary"):
     t0 = time.time()
     img_cv = pil_to_cv(img)
 
-    # Sélection du canal
+    # Canal
     if canal.startswith("Gris"):
         gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
     elif canal == "HSV-S":
-        hsv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2HSV)
-        gray = hsv[:, :, 1]
+        hsv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2HSV); gray = hsv[:,:,1]
     elif canal == "HSV-V":
-        hsv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2HSV)
-        gray = hsv[:, :, 2]
+        hsv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2HSV); gray = hsv[:,:,2]
     elif canal == "Lab-a":
-        lab = cv2.cvtColor(img_cv, cv2.COLOR_BGR2LAB)
-        gray = lab[:, :, 1]
-    else:  # Lab-b
-        lab = cv2.cvtColor(img_cv, cv2.COLOR_BGR2LAB)
-        gray = lab[:, :, 2]
+        lab = cv2.cvtColor(img_cv, cv2.COLOR_BGR2LAB); gray = lab[:,:,1]
+    else:
+        lab = cv2.cvtColor(img_cv, cv2.COLOR_BGR2LAB); gray = lab[:,:,2]
 
-    gray = equalize_if_needed(gray, use_clahe, clip=clahe_clip, tile=clahe_tile)
+    gray = equalize_if_needed(gray, use_clahe, clahe_clip, clahe_tile)
 
     if th_method == "Adaptive":
-        bw = threshold_image(gray, method="adaptive", invert=invert, block_size=block|1, C=C)
+        bw = threshold_image(gray, "adaptive", invert, block|1, C)
     else:
-        bw = threshold_image(gray, method="otsu", invert=invert)
+        bw = threshold_image(gray, "otsu", invert)
 
-    bw = morph_cleanup(bw, open_k=open_k, close_k=close_k)
+    bw = morph_cleanup(bw, open_k, close_k)
 
-    points = count_components(bw, min_area=min_area, max_area=max_area)
-    overlay = overlay_points(img, points, color=(0,255,0), radius=5)
+    comps, labels, stats = connected_components(bw)
+    base_points = [(c["cx"], c["cy"]) for c in comps
+                   if (min_area <= c["area"] <= max_area)]
 
-    auto_count = len(points)
-
-    # Mémoriser pour corrections
     st.session_state["base_img"] = img
-    st.session_state["bw"] = bw
-    st.session_state["points"] = points[:]         # version courante (corrigeable)
-    st.session_state["auto_count"] = auto_count
+    st.session_state["bw_init"] = bw
+    st.session_state["comps_init"] = comps
+    st.session_state["points_init"] = base_points
+    st.session_state["confirmed_ids"] = set()
+    st.session_state["rejected_ids"]  = set()
+    st.session_state["points_final"]  = base_points[:]  # pour corrections ultérieures
 
-    st.metric("Compte automatique", auto_count)
-    c1, c2 = st.columns(2)
-    with c1:
-        st.image(overlay, use_column_width=True, caption="Overlay (points sur items)")
-    with c2:
-        st.image(bw, use_column_width=True, caption="Binaire utilisé (contrôle)")
-    st.caption(f"Temps de traitement ~ {(time.time()-t0)*1000:.0f} ms")
+    st.success(f"Détection initiale: {len(base_points)} points • {(time.time()-t0)*1000:.0f} ms")
+    st.image(overlay_points(img, base_points, (0,255,0), 6),
+             use_column_width=True, caption="Overlay (détection initiale)")
 
-# ====== Corrections par clic ======
-if "points" in st.session_state:
-    st.subheader("Corrections par clic")
-    if not HAS_CLICK:
-        st.warning("Module `streamlit-image-coordinates` non disponible. "
-                   "Ajoute-le à requirements.txt puis redeploie : `streamlit-image-coordinates`.")
-    else:
-        mode = st.radio("Action", ["Supprimer un point", "Ajouter un point"], horizontal=True)
-        # image interactive (on redessine à chaque clic)
-        current_overlay = overlay_points(st.session_state["base_img"], st.session_state["points"], (0,255,0), radius=6)
-        click = streamlit_image_coordinates(current_overlay, key="corr_click")
+# ===== 2) Validation guidée (confirmer / rejeter) =====
+if "points_init" in st.session_state:
+    st.subheader("Validation guidée")
+    mode = st.radio("Action sur clic", ["Confirmer un bon point", "Rejeter un point erroné"], horizontal=True)
+    ov = overlay_points_colored(
+        st.session_state["base_img"], st.session_state["points_init"],
+        st.session_state["confirmed_ids"], st.session_state["rejected_ids"], radius=7
+    )
+    click = streamlit_image_coordinates(ov, key="val_click")
 
-        if click:
-            x, y = float(click["x"]), float(click["y"])
-            pts = list(st.session_state["points"])
-            if mode.startswith("Supprimer"):
-                idx, d = nearest_index(pts, x, y)
-                if idx is not None and d <= rm_radius and len(pts) > 0:
-                    pts.pop(idx)
-                    st.session_state["points"] = pts
-                    st.success(f"Point supprimé (d≈{d:.1f}px).")
+    if click:
+        x, y = float(click["x"]), float(click["y"])
+        idx, d = nearest_index(st.session_state["points_init"], x, y)
+        if idx is not None and d <= rm_radius:
+            if mode.startswith("Confirmer"):
+                st.session_state["confirmed_ids"].add(idx)
+                st.session_state["rejected_ids"].discard(idx)
             else:
-                idx, d = nearest_index(pts, x, y)
-                if d > rm_radius:
-                    pts.append((x, y))
-                    st.session_state["points"] = pts
-                    st.success("Point ajouté.")
+                st.session_state["rejected_ids"].add(idx)
+                st.session_state["confirmed_ids"].discard(idx)
 
-        st.image(overlay_points(st.session_state["base_img"], st.session_state["points"], (0,255,0), 6),
-                 use_column_width=True, caption="Overlay après corrections")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Confirmés (positifs)", len(st.session_state["confirmed_ids"]))
+    c2.metric("Rejetés (négatifs)", len(st.session_state["rejected_ids"]))
+    c3.button("Réinitialiser sélection",
+              on_click=lambda: (st.session_state["confirmed_ids"].clear(),
+                                st.session_state["rejected_ids"].clear()))
 
-    # ===== Export final =====
+    # ===== 3) Recompter avec indications =====
+    if st.button("🎯 Recompter avec indications"):
+        if len(st.session_state["confirmed_ids"]) < 3:
+            st.warning("Confirme au moins 3–5 points pour orienter correctement la couleur.")
+        else:
+            t1 = time.time()
+            pts_all = st.session_state["points_init"]
+            pos_pts = [pts_all[i] for i in sorted(st.session_state["confirmed_ids"])]
+            neg_pts = [pts_all[i] for i in sorted(st.session_state["rejected_ids"])]
+
+            # Apprendre couleur + segmenter
+            mask_guided = segment_from_hints(
+                pil_to_cv(st.session_state["base_img"]),
+                pos_pts, neg_pts,
+                r=seed_radius, thr_factor=thr_factor, pos_bias=pos_bias,
+                open_k=open_k, close_k=close_k
+            )
+
+            # Optionnel : séparer les objets collés
+            if use_watershed:
+                markers = split_touching_watershed(mask_guided)
+                # Adapter min/max area à partir des CONFIRMÉS (si dispo)
+                # -> récupérer aire des composantes proches des confirmés dans la détection initiale
+                areas_confirmed = []
+                comps0 = st.session_state["comps_init"]
+                for i in st.session_state["confirmed_ids"]:
+                    # aire “initiale” comme proxy
+                    # si besoin, on peut aussi recalculer par markers autour de ces centres
+                    if i < len(comps0):
+                        areas_confirmed.append(comps0[i]["area"])
+                if len(areas_confirmed) >= 3:
+                    q10 = np.percentile(areas_confirmed, 10)
+                    q90 = np.percentile(areas_confirmed, 90)
+                    minA = max(10, int(0.7*q10))
+                    maxA = int(1.6*q90)
+                else:
+                    minA, maxA = min_area, max_area
+
+                pts = centroids_from_markers(markers, minA, maxA)
+            else:
+                # simple connectedComponents sur le masque guidé
+                compsG, _, _ = connected_components(mask_guided)
+                # adapter min/max si confirmés dispo
+                areas_confirmed = []
+                comps0 = st.session_state["comps_init"]
+                for i in st.session_state["confirmed_ids"]:
+                    if i < len(comps0):
+                        areas_confirmed.append(comps0[i]["area"])
+                if len(areas_confirmed) >= 3:
+                    q10 = np.percentile(areas_confirmed, 10)
+                    q90 = np.percentile(areas_confirmed, 90)
+                    minA = max(10, int(0.7*q10))
+                    maxA = int(1.6*q90))
+                else:
+                    minA, maxA = min_area, max_area
+                pts = [(c["cx"], c["cy"]) for c in compsG if minA <= c["area"] <= maxA]
+
+            st.session_state["points_final"] = pts
+            st.success(f"Recomptage guidé: {len(pts)} points • {(time.time()-t1)*1000:.0f} ms")
+            st.image(overlay_points(st.session_state["base_img"], pts, (0,255,0), 6),
+                     use_column_width=True, caption="Overlay (recomptage guidé)")
+
+# ===== 4) Corrections fines puis Export =====
+if "points_final" in st.session_state:
+    st.subheader("Corrections fines (clic)")
+    mode2 = st.radio("Action", ["Supprimer", "Ajouter"], horizontal=True, key="corrmode")
+    ov2 = overlay_points(st.session_state["base_img"], st.session_state["points_final"], (0,255,0), 6)
+    click2 = streamlit_image_coordinates(ov2, key="corr_click2")
+
+    if click2:
+        x, y = float(click2["x"]), float(click2["y"])
+        pts = list(st.session_state["points_final"])
+        if mode2 == "Supprimer":
+            idx, d = nearest_index(pts, x, y)
+            if idx is not None and d <= rm_radius and len(pts)>0:
+                pts.pop(idx)
+        else:
+            idx, d = nearest_index(pts, x, y)
+            if d > rm_radius:
+                pts.append((x,y))
+        st.session_state["points_final"] = pts
+
+    st.metric("Compte final", len(st.session_state["points_final"]))
+    st.image(overlay_points(st.session_state["base_img"], st.session_state["points_final"], (0,255,0), 6),
+             use_column_width=True, caption="Overlay final")
+
+    # Exports
     st.subheader("Export")
-    final_count = max(0, len(st.session_state["points"]) + int(correction_typed))
-    st.metric("Compte final (après corrections + correction manuelle)", final_count)
-
     buf = io.BytesIO()
-    overlay_final = overlay_points(st.session_state["base_img"], st.session_state["points"], (0,255,0), 6)
+    overlay_final = overlay_points(st.session_state["base_img"], st.session_state["points_final"], (0,255,0), 6)
     overlay_final.save(buf, format="PNG")
     st.download_button("⬇️ Image annotée (PNG)", data=buf.getvalue(),
-                       file_name=f"overlay_{st.session_state.get('produit','objet')}.png", mime="image/png")
+                       file_name=f"overlay_{produit}.png", mime="image/png")
 
     df = pd.DataFrame([{
         "produit": produit,
         "fichier_image": getattr(up, "name", "upload.png"),
-        "canal": canal,
-        "method": th_method,
-        "invert": bool(invert),
-        "open_k": int(open_k),
-        "close_k": int(close_k),
-        "min_area": int(min_area),
-        "max_area": int(max_area),
-        "compte_auto": int(st.session_state["auto_count"]),
-        "compte_final_points": int(len(st.session_state["points"])),
-        "correction_typed": int(correction_typed),
-        "compte_final": int(final_count)
+        "nb_init": len(st.session_state.get("points_init", [])),
+        "nb_confirmes": len(st.session_state.get("confirmed_ids", [])),
+        "nb_rejetes": len(st.session_state.get("rejected_ids", [])),
+        "nb_final": len(st.session_state["points_final"]),
+        "canal": canal, "seuillage": th_method, "invert": bool(invert),
+        "open_k": int(open_k), "close_k": int(close_k)
     }])
     st.download_button("⬇️ Résumé (CSV)", data=df.to_csv(index=False).encode("utf-8"),
                        file_name=f"resume_{produit}.csv", mime="text/csv")
