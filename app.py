@@ -25,7 +25,12 @@ def resize_for_canvas(img_pil, max_side=1280):
     if max(w, h) <= max_side:
         return img_pil, 1.0
     s = max_side / max(w, h)
-    img2 = img_pil.resize((int(w*s), int(h*s)), Image.LANCZOS)
+    # Pour compatibilité PIL>=10
+    try:
+        resample = Image.Resampling.LANCZOS
+    except AttributeError:
+        resample = Image.LANCZOS
+    img2 = img_pil.resize((int(w*s), int(h*s)), resample)
     return img2, s
 
 def mask_from_strokes(canvas_json, h, w):
@@ -35,7 +40,7 @@ def mask_from_strokes(canvas_json, h, w):
     for obj in canvas_json["objects"]:
         if obj.get("type") == "path":
             path = obj.get("path", [])
-            if not path: 
+            if not path:
                 continue
             pts = []
             for seg in path:
@@ -43,8 +48,10 @@ def mask_from_strokes(canvas_json, h, w):
                     _, x, y = seg[:3]
                     pts.append((int(x), int(y)))
             if len(pts) >= 2:
-                cv2.polylines(mask, [np.array(pts, np.int32)], False, 255,
-                              thickness=max(1, int(obj.get("strokeWidth", 2))))
+                cv2.polylines(
+                    mask, [np.array(pts, np.int32)], False, 255,
+                    thickness=max(1, int(obj.get("strokeWidth", 2)))
+                )
     return mask
 
 def nearest_index(points, qx, qy):
@@ -69,7 +76,7 @@ def segment_from_seeds(img_bgr, pos_mask, neg_mask, thr_factor=3.0, pos_bias=1.0
     mu_pos = lab[pos_idx].mean(axis=0)
     if len(neg_idx) >= 10:
         mu_neg = lab[neg_idx].mean(axis=0)
-        dpos = np.linalg.norm(lab - mu_pos, axis=1)
+        dpos = np.linalg.norm(lab - mu_pos, axis1=1) if hasattr(np, 'axis1') else np.linalg.norm(lab - mu_pos, axis=1)
         dneg = np.linalg.norm(lab - mu_neg, axis=1)
         pred = (dpos < (pos_bias * dneg)).astype(np.uint8)
     else:
@@ -118,12 +125,12 @@ if not up:
     st.stop()
 
 orig = Image.open(up).convert("RGB")
-disp, scale = resize_for_canvas(orig, max_side=1280)   # <— clé : image redimensionnée pour le canvas
+disp, scale = resize_for_canvas(orig, max_side=1280)
 W, H = disp.size
 
 st.image(disp, caption="Image d'entrée", use_column_width=True)
 
-# 2) Canvases avec l'image *affichée* (numpy array)
+# 2) Canvases avec l'image PIL (pas numpy)
 st.subheader("Exemples utilisateur")
 cpos, cneg = st.columns(2)
 with cpos:
@@ -132,7 +139,7 @@ with cpos:
         fill_color="rgba(0,0,0,0)",
         stroke_width=10,
         stroke_color="#00FF00",
-        background_image=np.array(disp),   # <— numpy array, pas PIL
+        background_image=disp,           # <-- PIL Image
         update_streamlit=True,
         height=H, width=W,
         drawing_mode="freedraw",
@@ -144,7 +151,7 @@ with cneg:
         fill_color="rgba(0,0,0,0)",
         stroke_width=10,
         stroke_color="#FF0000",
-        background_image=np.array(disp),   # <— numpy array, pas PIL
+        background_image=disp,           # <-- PIL Image
         update_streamlit=True,
         height=H, width=W,
         drawing_mode="freedraw",
@@ -157,7 +164,7 @@ neg_mask = mask_from_strokes(can_neg.json_data, H, W)
 # 3) Comptage
 if st.button("🚀 Compter"):
     t0 = time.time()
-    img_cv = pil_to_cv(disp)  # on travaille à l'échelle affichée (simple & robuste pour le canvas)
+    img_cv = pil_to_cv(disp)
     mask = segment_from_seeds(
         img_cv, pos_mask, neg_mask,
         thr_factor=thr_factor, pos_bias=pos_bias,
@@ -185,7 +192,7 @@ if "points_auto" in st.session_state:
             fill_color="rgba(0,0,0,0)",
             stroke_width=12,
             stroke_color="#00FF00",
-            background_image=np.array(base_overlay),
+            background_image=base_overlay,  # <-- PIL Image
             update_streamlit=True,
             height=H, width=W,
             drawing_mode="circle",
@@ -197,7 +204,7 @@ if "points_auto" in st.session_state:
             fill_color="rgba(0,0,0,0)",
             stroke_width=12,
             stroke_color="#FF0000",
-            background_image=np.array(base_overlay),
+            background_image=base_overlay,  # <-- PIL Image
             update_streamlit=True,
             height=H, width=W,
             drawing_mode="circle",
