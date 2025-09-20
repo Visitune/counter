@@ -1,414 +1,169 @@
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 import pandas as pd
-import io, cv2, json
-from datetime import datetime
-import uuid
+import io, cv2, time
 
-# Génération d'ID unique pour traçabilité
-def generate_batch_id():
-    return f"CNT_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
-
-# Utils OpenCV
+# ---------- Utils ----------
 def pil_to_cv(img_pil):
     return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
 def cv_to_pil(img_cv):
     return Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
 
-def overlay_points(img_pil, points, color=(0,255,0), radius=8):
-    img = pil_to_cv(img_pil.copy())
+def resize_max(img_pil, max_side=1200):
+    w, h = img_pil.size
+    if max(w, h) <= max_side:
+        return img_pil, 1.0
+    s = max_side / max(w, h)
+    return img_pil.resize((int(w*s), int(h*s)), Image.Resampling.LANCZOS), s
+
+def draw_points_pil(image_pil, points, color=(0,255,0), radius=6):
+    img = pil_to_cv(image_pil.copy())
     for (x,y) in points:
-        cv2.circle(img, (int(x),int(y)), radius, color, -1)
-        cv2.circle(img, (int(x),int(y)), radius+2, (255,255,255), 2)
+        cv2.circle(img, (int(x),int(y)), radius, color, -1, lineType=cv2.LINE_AA)
     return cv_to_pil(img)
 
-# Segmentation par seuillage automatique - VERSION CORRIGÉE
-def auto_segment_food(img_cv, method='adaptive'):
-    """Segmentation automatique spécialisée pour produits alimentaires"""
-    
+def make_template_for_paint(img):
+    """Ajoute une barre d'instructions en haut de l'image à annoter (VERT=objet, ROUGE=fond)."""
+    w, h = img.size
+    banner_h = max(40, h//16)
+    tmpl = Image.new("RGB", (w, h + banner_h), color=(255,255,255))
+    tmpl.paste(img, (0, banner_h))
+    d = ImageDraw.Draw(tmpl)
+    text = "Dessinez VERT sur 3–5 objets • (Option) dessinez ROUGE sur le fond • Enregistrez puis ré-uploadez ici"
     try:
-        if method == 'adaptive':
-            # Conversion en niveaux de gris avec vérification du type
-            gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
-            
-            # Vérification que l'image est bien en uint8
-            if gray.dtype != np.uint8:
-                gray = gray.astype(np.uint8)
-            
-            # Paramètres adaptés pour éviter les erreurs
-            block_size = 15  # Doit être impair et > 1
-            C = 8  # Constante soustraite de la moyenne
-            
-            thresh = cv2.adaptiveThreshold(
-                gray, 255, 
-                cv2.ADAPTIVE_THRESHOLD_GAUSSIAN_C, 
-                cv2.THRESH_BINARY, 
-                block_size, C
-            )
-            
-        elif method == 'kmeans':
-            # K-means clustering plus robuste
-            h, w = img_cv.shape[:2]
-            data = img_cv.reshape((-1, 3)).astype(np.float32)
-            
-            # Critères de convergence
-            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
-            
-            # K-means avec gestion d'erreur
-            _, labels, centers = cv2.kmeans(
-                data, 2,  # 2 clusters au lieu de 3 pour plus de stabilité
-                None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS
-            )
-            
-            # Reconstruction
-            segmented = centers[labels.flatten()].reshape(img_cv.shape).astype(np.uint8)
-            gray = cv2.cvtColor(segmented, cv2.COLOR_BGR2GRAY)
-            _, thresh = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
-            
-        else:  # 'otsu'
-            # Méthode Otsu simple et fiable
-            gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
-            if gray.dtype != np.uint8:
-                gray = gray.astype(np.uint8)
-            _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        
-        # Nettoyage morphologique avec gestion d'erreur
-        kernel_size = min(5, min(thresh.shape) // 10)  # Taille adaptée à l'image
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-        
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
-        
-        return thresh
-        
-    except Exception as e:
-        st.error(f"Erreur de segmentation: {str(e)}")
-        # Fallback: seuillage simple
-        gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
-        _, thresh = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
-        return thresh
+        font = ImageFont.truetype("arial.ttf", size=max(12, banner_h//3))
+    except:
+        font = ImageFont.load_default()
+    d.text((10, 10), text, fill=(0,0,0), font=font)
+    # Légende
+    d.rectangle([w-240, 5, w-10, banner_h-5], outline=(0,0,0), width=1)
+    d.ellipse([w-230, 10, w-210, 30], fill=(0,255,0)); d.text((w-205, 12), "OBJET (VERT)", fill=(0,0,0), font=font)
+    d.ellipse([w-230, 30, w-210, 50], fill=(255,0,0)); d.text((w-205, 32), "FOND (ROUGE)", fill=(0,0,0), font=font)
+    return tmpl
 
-def count_objects_advanced(mask, min_area=100, max_area=10000, min_circularity=0.3):
-    """Comptage avancé avec filtres de forme"""
-    try:
-        # Vérification du masque
-        if mask is None or mask.size == 0:
-            return []
-        
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
-        
-        valid_objects = []
-        for i in range(1, num_labels):
-            area = stats[i, cv2.CC_STAT_AREA]
-            
-            if min_area <= area <= max_area:
-                cx, cy = centroids[i]
-                
-                # Analyse de forme simplifiée pour éviter les erreurs
-                object_mask = (labels == i).astype(np.uint8) * 255
-                contours, _ = cv2.findContours(object_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                
-                if contours:
-                    contour = max(contours, key=cv2.contourArea)
-                    perimeter = cv2.arcLength(contour, True)
-                    
-                    if perimeter > 0:
-                        circularity = 4 * np.pi * area / (perimeter * perimeter)
-                        if circularity >= min_circularity:
-                            valid_objects.append({
-                                'center': (float(cx), float(cy)),
-                                'area': int(area),
-                                'circularity': float(circularity)
-                            })
-                    else:
-                        # Si périmètre = 0, on accepte quand même l'objet
-                        valid_objects.append({
-                            'center': (float(cx), float(cy)),
-                            'area': int(area),
-                            'circularity': 0.5  # Valeur par défaut
-                        })
-        
-        return valid_objects
-    
-    except Exception as e:
-        st.error(f"Erreur de comptage: {str(e)}")
-        return []
+def extract_pos_neg_masks(annotated, top_banner=True):
+    """Extrait deux masques à partir d'un PNG annoté avec vert/rouge."""
+    img = annotated.convert("RGB")
+    w,h = img.size
+    y0 = (h//16) if top_banner else 0
+    crop = img.crop((0, y0, w, h))  # on ignore la bannière
+    arr = np.array(crop)
+    R,G,B = arr[:,:,0].astype(np.int16), arr[:,:,1].astype(np.int16), arr[:,:,2].astype(np.int16)
+    # tolérances (verts “suffisamment verts”, rouges “suffisamment rouges”)
+    pos = (G - np.maximum(R,B) >= 60) & (G >= 160)
+    neg = (R - np.maximum(G,B) >= 60) & (R >= 160)
+    pos_mask = np.uint8(pos) * 255
+    neg_mask = np.uint8(neg) * 255
+    return pos_mask, neg_mask
 
-# Configuration Streamlit
-st.set_page_config(page_title="Comptage Food Safety Pro", layout="wide")
+def segment_from_seeds(img_bgr, pos_mask, neg_mask,
+                       thr_factor=3.0, pos_bias=1.0,
+                       open_k=3, close_k=3):
+    H,W = img_bgr.shape[:2]
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).reshape(-1,3).astype(np.float32)
+    pos_idx = np.where(pos_mask.reshape(-1) > 0)[0]
+    neg_idx = np.where(neg_mask.reshape(-1) > 0)[0]
+    if len(pos_idx) < 10:
+        return np.zeros((H,W), np.uint8)
 
-st.markdown("""
-# 🔬 Comptage Automatique - Food Safety Pro
-### Interface professionnelle pour l'industrie alimentaire
-""")
+    mu_pos = lab[pos_idx].mean(axis=0)
+    if len(neg_idx) >= 10:
+        mu_neg = lab[neg_idx].mean(axis=0)
+        dpos = np.linalg.norm(lab - mu_pos, axis=1)
+        dneg = np.linalg.norm(lab - mu_neg, axis=1)
+        pred = (dpos < (pos_bias * dneg)).astype(np.uint8)
+    else:
+        dpos = np.linalg.norm(lab - mu_pos, axis=1)
+        ref = np.median(dpos[pos_idx]) if len(pos_idx) else dpos.mean()
+        pred = (dpos < (thr_factor * ref)).astype(np.uint8)
 
-# Sidebar avec métadonnées de traçabilité
+    mask = (pred.reshape(H,W) * 255).astype(np.uint8)
+    if open_k > 1:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_k, open_k))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
+    if close_k > 1:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k, close_k))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+    return mask
+
+def count_components(mask, min_area=80, max_area=100000):
+    num, labels, stats, cents = cv2.connectedComponentsWithStats(mask, 8)
+    pts = []
+    for i in range(1, num):
+        a = stats[i, cv2.CC_STAT_AREA]
+        if min_area <= a <= max_area:
+            cx, cy = cents[i]
+            pts.append((float(cx), float(cy)))
+    return pts
+
+# ---------- App ----------
+st.set_page_config(page_title="Comptage (méthode gabarit robuste)", layout="wide")
+st.title("🧮 Comptage simple et robuste (annoter dans un éditeur externe)")
+
 with st.sidebar:
-    st.header("🏭 Informations Traçabilité")
-    
-    if 'batch_id' not in st.session_state:
-        st.session_state.batch_id = generate_batch_id()
-    
-    st.code(st.session_state.batch_id, language=None)
-    
-    operator = st.text_input("Opérateur", placeholder="Nom de l'opérateur")
-    production_line = st.selectbox("Ligne de production", ["L1", "L2", "L3", "L4"])
-    lot_number = st.text_input("N° Lot", placeholder="LOT202X-XXX")
-    supplier = st.text_input("Fournisseur", placeholder="Nom du fournisseur")
-    
-    st.header("⚙️ Paramètres Technique")
-    method = st.selectbox("Méthode segmentation", 
-                         ["otsu", "adaptive", "kmeans"],
-                         help="Otsu recommandé pour la stabilité")
-    min_area = st.slider("Aire min (px²)", 50, 1000, 150)
-    max_area = st.slider("Aire max (px²)", 1000, 50000, 8000)
-    min_circularity = st.slider("Circularité min", 0.1, 1.0, 0.3, 0.1, 
-                               help="0.2-0.8 pour objets alimentaires typiques")
+    st.header("Paramètres")
+    thr_factor = st.slider("Seuil (si pas de négatifs)", 1.0, 6.0, 3.0, 0.1)
+    pos_bias   = st.slider("Biais pos/neg (si négatifs présents)", 0.5, 1.5, 1.0, 0.05)
+    open_k     = st.slider("Ouverture (morpho)", 1, 15, 3, 1)
+    close_k    = st.slider("Fermeture (morpho)", 1, 15, 3, 1)
+    min_area   = st.slider("Aire min (px²)", 10, 20000, 120, 10)
+    max_area   = st.slider("Aire max (px²)", 100, 300000, 30000, 500)
+    correction = st.number_input("Correction finale (+/-)", -9999, 9999, 0)
 
-# Zone principale
-tab1, tab2, tab3 = st.tabs(["📸 Analyse", "📊 Résultats", "📋 Rapport"])
+up = st.file_uploader("1) Déposer une image (JPG/PNG)", type=["jpg","jpeg","png"])
+if not up:
+    st.info("Dépose une image. Puis : Télécharger gabarit → dessiner VERT/ROUGE dans un éditeur → Ré-uploader le PNG annoté → Compter.")
+    st.stop()
 
-with tab1:
-    uploaded_file = st.file_uploader("Chargez l'image à analyser", 
-                                    type=['png', 'jpg', 'jpeg'],
-                                    help="Formats supportés: PNG, JPG, JPEG")
-    
-    if uploaded_file:
-        try:
-            # Traitement de l'image
-            original_image = Image.open(uploaded_file).convert('RGB')
-            
-            # Redimensionnement intelligent
-            w, h = original_image.size
-            max_display_size = 800  # Réduit pour plus de stabilité
-            
-            if max(w, h) > max_display_size:
-                scale = max_display_size / max(w, h)
-                display_w, display_h = int(w * scale), int(h * scale)
-                try:
-                    display_image = original_image.resize((display_w, display_h), Image.LANCZOS)
-                except AttributeError:
-                    display_image = original_image.resize((display_w, display_h), Image.ANTIALIAS)
-            else:
-                display_image = original_image
-                scale = 1.0
-            
-            col1, col2 = st.columns([2, 1])
-            with col1:
-                st.image(display_image, caption=f"Image source ({w}x{h}px)", use_column_width=True)
-            
-            with col2:
-                st.metric("Résolution", f"{w} × {h}")
-                st.metric("Taille fichier", f"{len(uploaded_file.getvalue())/1024:.1f} KB")
-                if scale != 1.0:
-                    st.info(f"Affichage redimensionné (×{scale:.2f})")
-            
-            # Analyse automatique
-            if st.button("🚀 Lancer l'analyse automatique", type="primary"):
-                with st.spinner("Analyse en cours..."):
-                    try:
-                        start_time = datetime.now()
-                        
-                        # Segmentation
-                        img_cv = pil_to_cv(display_image)
-                        mask = auto_segment_food(img_cv, method)
-                        
-                        # Comptage avec analyse de forme
-                        objects = count_objects_advanced(mask, min_area, max_area, min_circularity)
-                        
-                        # Points pour overlay
-                        points = [obj['center'] for obj in objects]
-                        
-                        # Adaptation à l'image originale
-                        if scale != 1.0:
-                            original_points = [(x/scale, y/scale) for x, y in points]
-                            final_overlay = overlay_points(original_image, original_points, (0, 255, 0), int(10/scale))
-                        else:
-                            original_points = points
-                            final_overlay = overlay_points(original_image, points, (0, 255, 0), 10)
-                        
-                        display_overlay = overlay_points(display_image, points, (0, 255, 0), 8)
-                        
-                        processing_time = (datetime.now() - start_time).total_seconds()
-                        
-                        # Sauvegarde résultats
-                        st.session_state.analysis_results = {
-                            'objects': objects,
-                            'count': len(objects),
-                            'display_overlay': display_overlay,
-                            'final_overlay': final_overlay,
-                            'mask': mask,
-                            'processing_time': processing_time,
-                            'parameters': {
-                                'method': method,
-                                'min_area': min_area,
-                                'max_area': max_area,
-                                'min_circularity': min_circularity
-                            },
-                            'metadata': {
-                                'batch_id': st.session_state.batch_id,
-                                'operator': operator,
-                                'line': production_line,
-                                'lot': lot_number,
-                                'supplier': supplier,
-                                'filename': uploaded_file.name,
-                                'timestamp': start_time.isoformat()
-                            }
-                        }
-                        
-                        st.success(f"✅ Analyse terminée en {processing_time:.2f}s")
-                        
-                    except Exception as e:
-                        st.error(f"Erreur lors de l'analyse: {str(e)}")
-                        st.info("Essayez de changer la méthode de segmentation ou les paramètres.")
-        
-        except Exception as e:
-            st.error(f"Erreur de chargement d'image: {str(e)}")
+orig = Image.open(up).convert("RGB")
+disp, scale = resize_max(orig, 1200)
+st.image(disp, caption="Image (échelle d'annotation)", use_column_width=True)
 
-with tab2:
-    if 'analysis_results' in st.session_state:
-        results = st.session_state.analysis_results
-        
-        # Métriques principales
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("🧮 Objets détectés", results['count'])
-        with col2:
-            if results['objects']:
-                avg_area = np.mean([obj['area'] for obj in results['objects']])
-                st.metric("📏 Aire moyenne", f"{avg_area:.0f} px²")
-            else:
-                st.metric("📏 Aire moyenne", "N/A")
-        with col3:
-            if results['objects']:
-                avg_circularity = np.mean([obj['circularity'] for obj in results['objects']])
-                st.metric("⭕ Circularité moy.", f"{avg_circularity:.2f}")
-            else:
-                st.metric("⭕ Circularité moy.", "N/A")
-        with col4:
-            st.metric("⏱️ Temps traitement", f"{results['processing_time']:.2f}s")
-        
-        # Visualisations
-        col1, col2 = st.columns(2)
-        with col1:
-            st.image(results['display_overlay'], caption="Résultat du comptage")
-        with col2:
-            try:
-                mask_colored = cv2.applyColorMap(results['mask'], cv2.COLORMAP_VIRIDIS)
-                mask_pil = cv_to_pil(mask_colored)
-                st.image(mask_pil, caption="Masque de segmentation")
-            except:
-                st.image(results['mask'], caption="Masque de segmentation (brut)")
-        
-        # Correction manuelle
-        st.subheader("🔧 Correction manuelle")
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            manual_correction = st.number_input("Ajustement (+/-)", 
-                                              min_value=-results['count'], 
-                                              max_value=100, 
-                                              value=0)
-        with col2:
-            final_count = max(0, results['count'] + manual_correction)
-            st.metric("Compte final", final_count)
-        with col3:
-            validation_status = st.selectbox("Statut validation", 
-                                           ["En attente", "Validé", "Rejeté"])
-        
-        # Commentaires
-        comments = st.text_area("Observations", 
-                               placeholder="Commentaires sur l'analyse...")
-        
-        # Mise à jour des résultats
-        if manual_correction != 0 or comments or validation_status != "En attente":
-            st.session_state.analysis_results['final_count'] = final_count
-            st.session_state.analysis_results['correction'] = manual_correction
-            st.session_state.analysis_results['validation_status'] = validation_status
-            st.session_state.analysis_results['comments'] = comments
-    else:
-        st.info("Effectuez d'abord une analyse dans l'onglet 'Analyse'")
+# 2) Gabarit à annoter
+st.subheader("2) Gabarit (à annoter dans Paint/Gimp, etc.)")
+tmpl = make_template_for_paint(disp)
+buf = io.BytesIO(); tmpl.save(buf, format="PNG")
+st.download_button("⬇️ Télécharger gabarit (PNG)", data=buf.getvalue(),
+                   file_name="gabarit_annotation.png", mime="image/png")
+st.caption("Ouvre ce PNG, peins **VERT** sur 3–5 objets et (option) **ROUGE** sur le fond, enregistre puis charge-le ci-dessous.")
 
-with tab3:
-    if 'analysis_results' in st.session_state:
-        results = st.session_state.analysis_results
-        
-        st.subheader("📋 Rapport d'analyse")
-        
-        # Données du rapport
-        report_data = {
-            'ID_Analyse': results['metadata']['batch_id'],
-            'Timestamp': results['metadata']['timestamp'],
-            'Operateur': results['metadata']['operator'] or 'Non renseigné',
-            'Ligne_Production': results['metadata']['line'],
-            'Numero_Lot': results['metadata']['lot'] or 'Non renseigné',
-            'Fournisseur': results['metadata']['supplier'] or 'Non renseigné',
-            'Fichier_Image': results['metadata']['filename'],
-            'Methode_Segmentation': results['parameters']['method'],
-            'Aire_Min_px2': results['parameters']['min_area'],
-            'Aire_Max_px2': results['parameters']['max_area'],
-            'Circularite_Min': results['parameters']['min_circularity'],
-            'Compte_Automatique': results['count'],
-            'Correction_Manuelle': results.get('correction', 0),
-            'Compte_Final': results.get('final_count', results['count']),
-            'Statut_Validation': results.get('validation_status', 'En attente'),
-            'Temps_Traitement_s': round(results['processing_time'], 3),
-            'Observations': results.get('comments', '')
-        }
-        
-        # Affichage du rapport
-        df_report = pd.DataFrame([report_data]).T
-        df_report.columns = ['Valeur']
-        st.dataframe(df_report, use_container_width=True)
-        
-        # Export
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            # Export image
-            try:
-                img_buffer = io.BytesIO()
-                results['final_overlay'].save(img_buffer, format='PNG')
-                st.download_button(
-                    "📸 Image annotée",
-                    data=img_buffer.getvalue(),
-                    file_name=f"{results['metadata']['batch_id']}_resultat.png",
-                    mime="image/png"
-                )
-            except Exception as e:
-                st.error(f"Erreur export image: {str(e)}")
-        
-        with col2:
-            # Export CSV
-            df_csv = pd.DataFrame([report_data])
-            csv_data = df_csv.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                "📊 Rapport CSV",
-                data=csv_data,
-                file_name=f"{results['metadata']['batch_id']}_rapport.csv",
-                mime="text/csv"
-            )
-        
-        with col3:
-            # Export JSON
-            try:
-                # Exclure les objets PIL pour l'export JSON
-                export_data = {k: v for k, v in results.items() 
-                              if k not in ['display_overlay', 'final_overlay']}
-                json_data = json.dumps(export_data, default=str, indent=2, ensure_ascii=False)
-                st.download_button(
-                    "🔧 Données JSON",
-                    data=json_data.encode('utf-8'),
-                    file_name=f"{results['metadata']['batch_id']}_donnees.json",
-                    mime="application/json"
-                )
-            except Exception as e:
-                st.error(f"Erreur export JSON: {str(e)}")
-    
-    else:
-        st.info("Effectuez d'abord une analyse pour générer un rapport.")
+ann = st.file_uploader("3) Charger le PNG annoté (le même gabarit modifié)", type=["png"])
+if not ann:
+    st.stop()
 
-# Footer
-st.markdown("---")
-st.caption("🔬 Comptage Food Safety Pro - Version 1.0 | Conforme aux standards de traçabilité alimentaire")
+annotated = Image.open(ann).convert("RGB")
+st.image(annotated, caption="PNG annoté (tel qu'uploadé)", use_column_width=True)
+
+# 4) Segmentation + Comptage
+if st.button("🚀 Compter"):
+    t0 = time.time()
+    pos_mask, neg_mask = extract_pos_neg_masks(annotated, top_banner=True)
+    img_cv = pil_to_cv(disp)
+    seg = segment_from_seeds(img_cv, pos_mask, neg_mask,
+                             thr_factor=thr_factor, pos_bias=pos_bias,
+                             open_k=open_k, close_k=close_k)
+    pts = count_components(seg, min_area=min_area, max_area=max_area)
+    overlay = draw_points_pil(disp, pts, (0,255,0), radius=6)
+    auto = len(pts)
+    final = max(0, auto + int(correction))
+
+    st.success(f"Compte auto: {auto}  •  Temps ~ {(time.time()-t0)*1000:.0f} ms")
+    st.metric("Compte final (avec correction)", final)
+    st.image(overlay, caption="Overlay (points sur items comptés)", use_column_width=True)
+
+    # 5) Exports
+    st.subheader("5) Export rapport")
+    nom = st.text_input("Nom validé (ex: crevettes, riz…)", value="")
+    img_buf = io.BytesIO(); overlay.save(img_buf, format="PNG")
+    st.download_button("⬇️ Image annotée (PNG)", data=img_buf.getvalue(),
+                       file_name=f"rapport_{nom or 'compte'}.png", mime="image/png")
+    df = pd.DataFrame([{
+        "nom_valide": nom or "objet",
+        "compte_auto": auto,
+        "correction": int(correction),
+        "compte_final": final
+    }])
+    st.download_button("⬇️ Résumé (CSV)", data=df.to_csv(index=False).encode("utf-8"),
+                       file_name=f"rapport_{nom or 'compte'}.csv", mime="text/csv")
