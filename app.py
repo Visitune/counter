@@ -3,10 +3,10 @@ from streamlit_drawable_canvas import st_canvas
 from PIL import Image
 import numpy as np
 import pandas as pd
-import io, time, cv2
+import io, time, cv2, re
 from math import sqrt
 
-# ---------- Utils ----------
+# ============ Utils ============
 def pil_to_cv(img_pil):
     return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
@@ -19,7 +19,7 @@ def overlay_points_pil(image_pil, points, color=(0,255,0), radius=6):
         cv2.circle(img, (int(x),int(y)), radius, color, -1, lineType=cv2.LINE_AA)
     return cv_to_pil(img)
 
-def resize_for_canvas(img_pil, max_side=1280):
+def resize_for_canvas(img_pil, max_side=1024):
     w, h = img_pil.size
     if max(w, h) <= max_side:
         return img_pil
@@ -30,14 +30,34 @@ def resize_for_canvas(img_pil, max_side=1280):
         resample = Image.LANCZOS
     return img_pil.resize((int(w*s), int(h*s)), resample)
 
-def mask_from_strokes(canvas_json, h, w):
-    import cv2
-    mask = np.zeros((h, w), dtype=np.uint8)
+def _color_to_rgb_tuple(color_str):
+    """'#RRGGBB' => (r,g,b) ; 'rgb(r,g,b)' => (r,g,b) ; sinon None."""
+    if isinstance(color_str, str):
+        if color_str.startswith("#") and len(color_str)==7:
+            r = int(color_str[1:3], 16); g = int(color_str[3:5], 16); b = int(color_str[5:7], 16)
+            return (r,g,b)
+        m = re.match(r"rgb\((\d+),\s*(\d+),\s*(\d+)\)", color_str)
+        if m: return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    return None
+
+def _is_green(color_str):
+    rgb = _color_to_rgb_tuple(color_str)
+    return rgb is not None and rgb[1] >= 200 and rgb[0] <= 80 and rgb[2] <= 80  # ~vert
+
+def _is_red(color_str):
+    rgb = _color_to_rgb_tuple(color_str)
+    return rgb is not None and rgb[0] >= 200 and rgb[1] <= 80 and rgb[2] <= 80  # ~rouge
+
+def masks_from_canvas(canvas_json, h, w):
+    """Construit deux masques (pos/neg) à partir des traits en lisant la couleur de chaque objet."""
+    pos = np.zeros((h, w), dtype=np.uint8)
+    neg = np.zeros((h, w), dtype=np.uint8)
     if not canvas_json or "objects" not in canvas_json:
-        return mask
+        return pos, neg
     for obj in canvas_json["objects"]:
         if obj.get("type") != "path":
             continue
+        stroke = obj.get("stroke") or obj.get("strokeColor") or ""
         path = obj.get("path", [])
         if not path: 
             continue
@@ -47,11 +67,12 @@ def mask_from_strokes(canvas_json, h, w):
                 _, x, y = seg[:3]
                 pts.append((int(x), int(y)))
         if len(pts) >= 2:
-            cv2.polylines(
-                mask, [np.array(pts, np.int32)], False, 255,
-                thickness=max(1, int(obj.get("strokeWidth", 2)))
-            )
-    return mask
+            thickness = max(1, int(obj.get("strokeWidth", 10)))
+            target = pos if _is_green(stroke) else (neg if _is_red(stroke) else None)
+            if target is None:
+                continue
+            cv2.polylines(target, [np.array(pts, np.int32)], False, 255, thickness=thickness)
+    return pos, neg
 
 def segment_from_seeds(img_bgr, pos_mask, neg_mask, thr_factor=3.0, pos_bias=1.0,
                        open_ksize=3, close_ksize=3):
@@ -101,12 +122,15 @@ def nearest_index(points, qx, qy):
         if d < dmin: dmin, kmin = d, k
     return kmin, dmin**0.5
 
-# ---------- App ----------
-st.set_page_config(page_title="Comptage assisté — simple", layout="wide")
+# ============ App ============
+st.set_page_config(page_title="Comptage assisté — très simple", layout="wide")
 st.title("🧮 Comptage assisté (peindre 3 exemples) — générique")
 
 with st.sidebar:
     st.header("Réglages")
+    paint_mode = st.radio("Couleur du trait", ["Objet (VERT)", "Fond (ROUGE)"], horizontal=True)
+    stroke_color = "#00FF00" if "VERT" in paint_mode else "#FF0000"
+
     thr_factor = st.slider("Seuil (sans négatifs)", 1.0, 6.0, 3.0, 0.1)
     pos_bias   = st.slider("Biais pos/neg (avec négatifs)", 0.5, 1.5, 1.0, 0.05)
     open_ksize = st.slider("Ouverture", 1, 15, 3, 1)
@@ -119,89 +143,85 @@ with st.sidebar:
 # 1) Upload
 up = st.file_uploader("Dépose une image (JPG/PNG)", type=["jpg","jpeg","png"])
 if not up:
-    st.info("1) Charge la photo. 2) Peins des traits VERTS sur 3 items (ou +). 3) (Option) quelques traits ROUGES sur le fond. 4) Clique **Compter**.")
+    st.info("1) Charge la photo. 2) Peins des traits VERTS sur 3 items (ou +), et éventuellement ROUGES sur le fond. 3) Clique **Compter**.")
     st.stop()
 
 orig = Image.open(up).convert("RGB")
-disp = resize_for_canvas(orig, max_side=1280)
+disp = resize_for_canvas(orig, max_side=1024)
+W, H = disp.size
 st.image(disp, caption="Image d'entrée", use_column_width=True)
 
-# 2) Canvases — IMPORTANT: PIL RGBA + width/height=None
-disp_rgba = disp.convert("RGBA")  # le composant gère très bien RGBA
-st.subheader("Exemples utilisateur")
-cpos, cneg = st.columns(2)
-with cpos:
-    st.caption("Traits OBJET (VERT) — peins sur 3 items (ou plus)")
-    can_pos = st_canvas(
-        background_image=disp_rgba.copy(),  # PIL Image
-        drawing_mode="freedraw",
-        stroke_width=10,
-        stroke_color="#00FF00",
-        fill_color="rgba(0,0,0,0)",
-        update_streamlit=True,
-        key="can_pos"
-    )
-with cneg:
-    st.caption("Traits FOND (ROUGE) — optionnel")
-    can_neg = st_canvas(
-        background_image=disp_rgba.copy(),  # PIL Image
-        drawing_mode="freedraw",
-        stroke_width=10,
-        stroke_color="#FF0000",
-        fill_color="rgba(0,0,0,0)",
-        update_streamlit=True,
-        key="can_neg"
-    )
+# Clé de canvas pour forcer le refresh si on clique sur 'Effacer'
+if "canvas_key" not in st.session_state:
+    st.session_state["canvas_key"] = 0
+if st.button("🧹 Effacer les traits"):
+    st.session_state["canvas_key"] += 1
 
-H, W = disp_rgba.size[1], disp_rgba.size[0]
-pos_mask = mask_from_strokes(can_pos.json_data, H, W)
-neg_mask = mask_from_strokes(can_neg.json_data, H, W)
+# 2) Un seul canvas (conserve tous les traits)
+st.subheader("Exemples utilisateur (peindre ici)")
+canvas = st_canvas(
+    background_image=disp.convert("RGBA"),   # PIL RGBA
+    drawing_mode="freedraw",
+    stroke_width=10,
+    stroke_color=stroke_color,               # vert/rouge selon le choix
+    fill_color="rgba(0,0,0,0)",
+    update_streamlit=True,
+    height=H, width=W,                       # dimensions explicites
+    key=f"canvas_{st.session_state['canvas_key']}"
+)
+
+# Construire les deux masques en lisant la couleur de chaque trait
+pos_mask, neg_mask = masks_from_canvas(canvas.json_data, H, W)
 
 # 3) Compter
 if st.button("🚀 Compter"):
     t0 = time.time()
-    img_cv = pil_to_cv(disp_rgba.convert("RGB"))
+    img_cv = pil_to_cv(disp)
     mask = segment_from_seeds(
         img_cv, pos_mask, neg_mask,
         thr_factor=thr_factor, pos_bias=pos_bias,
         open_ksize=open_ksize, close_ksize=close_ksize
     )
     points_auto = count_from_mask(mask, min_area=min_area, max_area=max_area)
-    overlay_auto = overlay_points_pil(disp_rgba.convert("RGB"), points_auto, (0,255,0), radius=6)
-    st.session_state["disp"] = disp_rgba.convert("RGB")
+    overlay_auto = overlay_points_pil(disp, points_auto, (0,255,0), radius=6)
+
+    st.session_state["disp"] = disp
     st.session_state["points_auto"] = points_auto
     st.session_state["overlay_auto"] = overlay_auto
+
     st.success(f"Compte auto: {len(points_auto)}")
     st.caption(f"Temps de traitement ~ {(time.time()-t0)*1000:.0f} ms")
     st.image(overlay_auto, caption="Overlay comptage automatique", use_column_width=True)
 
-# 4) Corrections (ajout/suppression par petits cercles)
+# 4) Corrections rapides (cliquer pour ajouter/supprimer)
 if "points_auto" in st.session_state:
     disp_rgb = st.session_state["disp"]
-    base_overlay = st.session_state["overlay_auto"]
+    overlay = st.session_state["overlay_auto"]
 
     st.subheader("Corrections (option)")
-    ca, cb = st.columns(2)
-    with ca:
+    colA, colB = st.columns(2)
+    with colA:
         st.caption("Ajouter des points MANQUANTS (VERT) — dessine de petits cercles")
         can_add = st_canvas(
-            background_image=base_overlay.copy(),  # PIL
+            background_image=overlay.copy(),
             drawing_mode="circle",
             stroke_width=12,
             stroke_color="#00FF00",
             fill_color="rgba(0,0,0,0)",
             update_streamlit=True,
+            height=H, width=W,
             key="can_add"
         )
-    with cb:
+    with colB:
         st.caption("Supprimer des faux positifs (ROUGE) — dessine de petits cercles")
         can_rem = st_canvas(
-            background_image=base_overlay.copy(),  # PIL
+            background_image=overlay.copy(),
             drawing_mode="circle",
             stroke_width=12,
             stroke_color="#FF0000",
             fill_color="rgba(0,0,0,0)",
             update_streamlit=True,
+            height=H, width=W,
             key="can_rem"
         )
 
@@ -218,14 +238,7 @@ if "points_auto" in st.session_state:
     add_pts = extract_circle_centers(can_add.json_data)
     rem_pts = extract_circle_centers(can_rem.json_data)
 
-    def nearest_index(points, qx, qy):
-        if not points: return None, 1e9
-        dmin, kmin = 1e9, None
-        for k,(x,y) in enumerate(points):
-            d = (x-qx)**2 + (y-qy)**2
-            if d < dmin: dmin, kmin = d, k
-        return kmin, dmin**0.5
-
+    # appliquer corrections
     detected = list(st.session_state["points_auto"])
     # remove
     for (rx,ry) in rem_pts:
@@ -242,7 +255,7 @@ if "points_auto" in st.session_state:
     st.metric("Compte final", len(detected))
     st.image(final_overlay, caption="Overlay final (après corrections)", use_column_width=True)
 
-    # Rapport simple (image + CSV)
+    # 5) Rapport simple
     st.subheader("Rapport")
     validated_name = st.text_input("Nom validé à afficher", value="")
     buf = io.BytesIO()
