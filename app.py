@@ -3,23 +3,15 @@ from streamlit_drawable_canvas import st_canvas
 from PIL import Image
 import numpy as np
 import pandas as pd
-from pathlib import Path
-import io, json, time, cv2, base64
+import io, time, cv2
 from math import sqrt
 
-# ---------------- Utils ----------------
+# ---------- Utils ----------
 def pil_to_cv(img_pil):
     return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
 def cv_to_pil(img_cv):
     return Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
-
-def pil_to_base64(img_pil):
-    """Convertit image PIL en base64 pour st_canvas"""
-    buffer = io.BytesIO()
-    img_pil.save(buffer, format="PNG")
-    img_str = base64.b64encode(buffer.getvalue()).decode()
-    return f"data:image/png;base64,{img_str}"
 
 def overlay_points_pil(image_pil, points, color=(0,255,0), radius=6):
     img = pil_to_cv(image_pil.copy())
@@ -27,49 +19,40 @@ def overlay_points_pil(image_pil, points, color=(0,255,0), radius=6):
         cv2.circle(img, (int(x),int(y)), radius, color, -1, lineType=cv2.LINE_AA)
     return cv_to_pil(img)
 
-def resize_for_canvas(img_pil, max_side=800):
-    """Redimensionne l'image pour le canvas avec une taille plus raisonnable"""
+def resize_for_canvas(img_pil, max_side=1280):
     w, h = img_pil.size
     if max(w, h) <= max_side:
-        return img_pil, 1.0
+        return img_pil
     s = max_side / max(w, h)
     try:
         resample = Image.Resampling.LANCZOS
     except AttributeError:
         resample = Image.LANCZOS
-    img2 = img_pil.resize((int(w*s), int(h*s)), resample)
-    return img2, s
+    return img_pil.resize((int(w*s), int(h*s)), resample)
 
 def mask_from_strokes(canvas_json, h, w):
+    import cv2
     mask = np.zeros((h, w), dtype=np.uint8)
     if not canvas_json or "objects" not in canvas_json:
         return mask
     for obj in canvas_json["objects"]:
-        if obj.get("type") == "path":
-            path = obj.get("path", [])
-            if not path:
-                continue
-            pts = []
-            for seg in path:
-                if len(seg) >= 3:
-                    _, x, y = seg[:3]
-                    pts.append((int(x), int(y)))
-            if len(pts) >= 2:
-                cv2.polylines(
-                    mask, [np.array(pts, np.int32)], False, 255,
-                    thickness=max(1, int(obj.get("strokeWidth", 2)))
-                )
+        if obj.get("type") != "path":
+            continue
+        path = obj.get("path", [])
+        if not path: 
+            continue
+        pts = []
+        for seg in path:
+            if len(seg) >= 3:
+                _, x, y = seg[:3]
+                pts.append((int(x), int(y)))
+        if len(pts) >= 2:
+            cv2.polylines(
+                mask, [np.array(pts, np.int32)], False, 255,
+                thickness=max(1, int(obj.get("strokeWidth", 2)))
+            )
     return mask
 
-def nearest_index(points, qx, qy):
-    if not points: return None, 1e9
-    dmin, kmin = 1e9, None
-    for k,(x,y) in enumerate(points):
-        d = (x-qx)**2 + (y-qy)**2
-        if d < dmin: dmin, kmin = d, k
-    return kmin, dmin**0.5
-
-# ---- Segmentation guidée par exemples (Lab) ----
 def segment_from_seeds(img_bgr, pos_mask, neg_mask, thr_factor=3.0, pos_bias=1.0,
                        open_ksize=3, close_ksize=3):
     H,W = img_bgr.shape[:2]
@@ -110,8 +93,16 @@ def count_from_mask(mask, min_area=80, max_area=50000):
             points.append((float(cx), float(cy)))
     return points
 
-# ---------------- App ----------------
-st.set_page_config(page_title="Comptage assisté — très simple", layout="wide")
+def nearest_index(points, qx, qy):
+    if not points: return None, 1e9
+    dmin, kmin = 1e9, None
+    for k,(x,y) in enumerate(points):
+        d = (x-qx)**2 + (y-qy)**2
+        if d < dmin: dmin, kmin = d, k
+    return kmin, dmin**0.5
+
+# ---------- App ----------
+st.set_page_config(page_title="Comptage assisté — simple", layout="wide")
 st.title("🧮 Comptage assisté (peindre 3 exemples) — générique")
 
 with st.sidebar:
@@ -128,115 +119,89 @@ with st.sidebar:
 # 1) Upload
 up = st.file_uploader("Dépose une image (JPG/PNG)", type=["jpg","jpeg","png"])
 if not up:
-    st.info("1) Charge la photo. 2) Peins quelques traits verts sur 3 items (ou +). 3) (Option) peins des traits rouges sur le fond. 4) Clique **Compter**.")
+    st.info("1) Charge la photo. 2) Peins des traits VERTS sur 3 items (ou +). 3) (Option) quelques traits ROUGES sur le fond. 4) Clique **Compter**.")
     st.stop()
 
 orig = Image.open(up).convert("RGB")
-disp, scale = resize_for_canvas(orig, max_side=800)  # Taille plus raisonnable
-W, H = disp.size
-
+disp = resize_for_canvas(orig, max_side=1280)
 st.image(disp, caption="Image d'entrée", use_column_width=True)
 
-# 2) Canvases avec l'image convertie en base64
+# 2) Canvases — IMPORTANT: PIL RGBA + width/height=None
+disp_rgba = disp.convert("RGBA")  # le composant gère très bien RGBA
 st.subheader("Exemples utilisateur")
-
-# Convertir l'image en base64 pour le canvas
-bg_image = pil_to_base64(disp)
-
 cpos, cneg = st.columns(2)
 with cpos:
     st.caption("Traits OBJET (VERT) — peins sur 3 items (ou plus)")
     can_pos = st_canvas(
-        fill_color="rgba(0,0,0,0)",
-        stroke_width=8,
-        stroke_color="#00FF00",
-        background_image=bg_image,        # Image en base64
-        update_streamlit=True,
-        height=H, width=W,
+        background_image=disp_rgba.copy(),  # PIL Image
         drawing_mode="freedraw",
+        stroke_width=10,
+        stroke_color="#00FF00",
+        fill_color="rgba(0,0,0,0)",
+        update_streamlit=True,
         key="can_pos"
     )
 with cneg:
     st.caption("Traits FOND (ROUGE) — optionnel")
     can_neg = st_canvas(
-        fill_color="rgba(0,0,0,0)",
-        stroke_width=8,
-        stroke_color="#FF0000",
-        background_image=bg_image,        # Image en base64
-        update_streamlit=True,
-        height=H, width=W,
+        background_image=disp_rgba.copy(),  # PIL Image
         drawing_mode="freedraw",
+        stroke_width=10,
+        stroke_color="#FF0000",
+        fill_color="rgba(0,0,0,0)",
+        update_streamlit=True,
         key="can_neg"
     )
 
+H, W = disp_rgba.size[1], disp_rgba.size[0]
 pos_mask = mask_from_strokes(can_pos.json_data, H, W)
 neg_mask = mask_from_strokes(can_neg.json_data, H, W)
 
-# Debug: Afficher si des traits ont été détectés
-if np.sum(pos_mask) > 0:
-    st.success(f"✅ Traits verts détectés ({np.sum(pos_mask > 0)} pixels)")
-if np.sum(neg_mask) > 0:
-    st.info(f"ℹ️ Traits rouges détectés ({np.sum(neg_mask > 0)} pixels)")
-
-# 3) Comptage
+# 3) Compter
 if st.button("🚀 Compter"):
-    if np.sum(pos_mask) == 0:
-        st.error("❌ Aucun trait vert détecté ! Dessine d'abord sur quelques objets.")
-    else:
-        t0 = time.time()
-        img_cv = pil_to_cv(disp)
-        mask = segment_from_seeds(
-            img_cv, pos_mask, neg_mask,
-            thr_factor=thr_factor, pos_bias=pos_bias,
-            open_ksize=open_ksize, close_ksize=close_ksize
-        )
-        points_auto = count_from_mask(mask, min_area=min_area, max_area=max_area)
-        overlay_auto = overlay_points_pil(disp, points_auto, (0,255,0), radius=6)
-        
-        # Sauvegarder dans session state
-        st.session_state["disp"] = disp
-        st.session_state["points_auto"] = points_auto
-        st.session_state["overlay_auto"] = overlay_auto
-        st.session_state["orig"] = orig
-        st.session_state["scale"] = scale
-        
-        st.success(f"Compte auto: {len(points_auto)}")
-        st.caption(f"Temps de traitement ~ {(time.time()-t0)*1000:.0f} ms")
-        st.image(overlay_auto, caption="Overlay comptage automatique", use_column_width=True)
+    t0 = time.time()
+    img_cv = pil_to_cv(disp_rgba.convert("RGB"))
+    mask = segment_from_seeds(
+        img_cv, pos_mask, neg_mask,
+        thr_factor=thr_factor, pos_bias=pos_bias,
+        open_ksize=open_ksize, close_ksize=close_ksize
+    )
+    points_auto = count_from_mask(mask, min_area=min_area, max_area=max_area)
+    overlay_auto = overlay_points_pil(disp_rgba.convert("RGB"), points_auto, (0,255,0), radius=6)
+    st.session_state["disp"] = disp_rgba.convert("RGB")
+    st.session_state["points_auto"] = points_auto
+    st.session_state["overlay_auto"] = overlay_auto
+    st.success(f"Compte auto: {len(points_auto)}")
+    st.caption(f"Temps de traitement ~ {(time.time()-t0)*1000:.0f} ms")
+    st.image(overlay_auto, caption="Overlay comptage automatique", use_column_width=True)
 
-# 4) Corrections
+# 4) Corrections (ajout/suppression par petits cercles)
 if "points_auto" in st.session_state:
-    disp = st.session_state["disp"]
+    disp_rgb = st.session_state["disp"]
     base_overlay = st.session_state["overlay_auto"]
 
     st.subheader("Corrections (option)")
-    
-    # Convertir l'overlay en base64 pour les canvas de correction
-    overlay_b64 = pil_to_base64(base_overlay)
-    
     ca, cb = st.columns(2)
     with ca:
         st.caption("Ajouter des points MANQUANTS (VERT) — dessine de petits cercles")
         can_add = st_canvas(
-            fill_color="rgba(0,255,0,0.3)",
-            stroke_width=2,
-            stroke_color="#00FF00",
-            background_image=overlay_b64,     # Overlay en base64
-            update_streamlit=True,
-            height=H, width=W,
+            background_image=base_overlay.copy(),  # PIL
             drawing_mode="circle",
+            stroke_width=12,
+            stroke_color="#00FF00",
+            fill_color="rgba(0,0,0,0)",
+            update_streamlit=True,
             key="can_add"
         )
     with cb:
         st.caption("Supprimer des faux positifs (ROUGE) — dessine de petits cercles")
         can_rem = st_canvas(
-            fill_color="rgba(255,0,0,0.3)",
-            stroke_width=2,
-            stroke_color="#FF0000",
-            background_image=overlay_b64,     # Overlay en base64
-            update_streamlit=True,
-            height=H, width=W,
+            background_image=base_overlay.copy(),  # PIL
             drawing_mode="circle",
+            stroke_width=12,
+            stroke_color="#FF0000",
+            fill_color="rgba(0,0,0,0)",
+            update_streamlit=True,
             key="can_rem"
         )
 
@@ -245,72 +210,49 @@ if "points_auto" in st.session_state:
         if not json_data or "objects" not in json_data: return pts
         for o in json_data["objects"]:
             if o.get("type")=="circle":
-                cx = int(o["left"] + o.get("rx", o.get("radius", 0)))
-                cy = int(o["top"]  + o.get("ry", o.get("radius", 0)))
+                cx = int(o["left"] + o["rx"])
+                cy = int(o["top"]  + o["ry"])
                 pts.append((cx,cy))
         return pts
 
     add_pts = extract_circle_centers(can_add.json_data)
     rem_pts = extract_circle_centers(can_rem.json_data)
 
-    def apply_corrections(points, add_pts, rem_pts, rm_radius):
-        pts = list(points)
-        for (rx,ry) in rem_pts:
-            idx, d = nearest_index(pts, rx, ry)
-            if idx is not None and d <= rm_radius and len(pts)>0:
-                pts.pop(idx)
-        for (ax,ay) in add_pts:
-            idx, d = nearest_index(pts, ax, ay)
-            if d > rm_radius:
-                pts.append((ax,ay))
-        return pts
+    def nearest_index(points, qx, qy):
+        if not points: return None, 1e9
+        dmin, kmin = 1e9, None
+        for k,(x,y) in enumerate(points):
+            d = (x-qx)**2 + (y-qy)**2
+            if d < dmin: dmin, kmin = d, k
+        return kmin, dmin**0.5
 
-    detected = apply_corrections(st.session_state["points_auto"], add_pts, rem_pts, rm_radius)
-    
-    # Redimensionner les points vers l'image originale si nécessaire
-    if st.session_state.get("scale", 1.0) != 1.0:
-        scale = st.session_state["scale"]
-        detected_orig = [(x/scale, y/scale) for x,y in detected]
-        final_overlay_orig = overlay_points_pil(st.session_state["orig"], detected_orig, (0,255,0), radius=int(6/scale))
-    else:
-        detected_orig = detected
-        final_overlay_orig = overlay_points_pil(disp, detected, (0,255,0), radius=6)
-    
-    final_overlay = overlay_points_pil(disp, detected, (0,255,0), radius=6)
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric("Compte final", len(detected))
-        if add_pts:
-            st.success(f"➕ {len(add_pts)} ajouts")
-        if rem_pts:
-            st.warning(f"➖ {len(rem_pts)} suppressions")
-    with col2:
-        correction = len(detected) - len(st.session_state["points_auto"])
-        if correction != 0:
-            st.metric("Correction", f"{correction:+d}")
-    
+    detected = list(st.session_state["points_auto"])
+    # remove
+    for (rx,ry) in rem_pts:
+        idx, d = nearest_index(detected, rx, ry)
+        if idx is not None and d <= rm_radius and len(detected)>0:
+            detected.pop(idx)
+    # add
+    for (ax,ay) in add_pts:
+        idx, d = nearest_index(detected, ax, ay)
+        if d > rm_radius:
+            detected.append((ax,ay))
+
+    final_overlay = overlay_points_pil(disp_rgb, detected, (0,255,0), radius=6)
+    st.metric("Compte final", len(detected))
     st.image(final_overlay, caption="Overlay final (après corrections)", use_column_width=True)
 
-    # 5) Rapport simple
-    st.subheader("Rapport simple")
-    validated_name = st.text_input("Nom validé à afficher", value=st.session_state.get("validated_name",""))
-    
-    # Utiliser l'image originale pour l'export
+    # Rapport simple (image + CSV)
+    st.subheader("Rapport")
+    validated_name = st.text_input("Nom validé à afficher", value="")
     buf = io.BytesIO()
-    final_overlay_orig.save(buf, format="PNG")
+    final_overlay.save(buf, format="PNG")
     st.download_button("⬇️ Image annotée (PNG)", data=buf.getvalue(),
                        file_name=f"rapport_{validated_name or 'compte'}.png", mime="image/png")
-    
     df = pd.DataFrame([{
         "nom_valide": validated_name or "objet",
         "compte_final": len(detected),
-        "compte_auto": len(st.session_state['points_auto']),
-        "correction": len(detected) - len(st.session_state['points_auto']),
-        "fichier": up.name if up else "image.png"
+        "compte_auto": len(st.session_state['points_auto'])
     }])
     st.download_button("⬇️ Résumé (CSV)", data=df.to_csv(index=False).encode("utf-8"),
                        file_name=f"rapport_{validated_name or 'compte'}.csv", mime="text/csv")
-    
-    # Afficher le dataframe pour vérification
-    st.dataframe(df, use_container_width=True)
