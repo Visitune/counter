@@ -5,4 +5,5 @@ pandas==2.2.2
 opencv-python-headless==4.10.0.84
 plotly==5.24.0
 streamlit-plotly-events==0.0.6
+streamlit-image-coordinates
 
