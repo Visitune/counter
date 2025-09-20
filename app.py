@@ -4,7 +4,7 @@ from PIL import Image
 import numpy as np
 import pandas as pd
 from pathlib import Path
-import io, json, time, cv2
+import io, json, time, cv2, base64
 from math import sqrt
 
 # ---------------- Utils ----------------
@@ -14,18 +14,25 @@ def pil_to_cv(img_pil):
 def cv_to_pil(img_cv):
     return Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
 
+def pil_to_base64(img_pil):
+    """Convertit image PIL en base64 pour st_canvas"""
+    buffer = io.BytesIO()
+    img_pil.save(buffer, format="PNG")
+    img_str = base64.b64encode(buffer.getvalue()).decode()
+    return f"data:image/png;base64,{img_str}"
+
 def overlay_points_pil(image_pil, points, color=(0,255,0), radius=6):
     img = pil_to_cv(image_pil.copy())
     for (x,y) in points:
         cv2.circle(img, (int(x),int(y)), radius, color, -1, lineType=cv2.LINE_AA)
     return cv_to_pil(img)
 
-def resize_for_canvas(img_pil, max_side=1280):
+def resize_for_canvas(img_pil, max_side=800):
+    """Redimensionne l'image pour le canvas avec une taille plus raisonnable"""
     w, h = img_pil.size
     if max(w, h) <= max_side:
         return img_pil, 1.0
     s = max_side / max(w, h)
-    # Pour compatibilité PIL>=10
     try:
         resample = Image.Resampling.LANCZOS
     except AttributeError:
@@ -76,7 +83,7 @@ def segment_from_seeds(img_bgr, pos_mask, neg_mask, thr_factor=3.0, pos_bias=1.0
     mu_pos = lab[pos_idx].mean(axis=0)
     if len(neg_idx) >= 10:
         mu_neg = lab[neg_idx].mean(axis=0)
-        dpos = np.linalg.norm(lab - mu_pos, axis1=1) if hasattr(np, 'axis1') else np.linalg.norm(lab - mu_pos, axis=1)
+        dpos = np.linalg.norm(lab - mu_pos, axis=1)
         dneg = np.linalg.norm(lab - mu_neg, axis=1)
         pred = (dpos < (pos_bias * dneg)).astype(np.uint8)
     else:
@@ -125,21 +132,25 @@ if not up:
     st.stop()
 
 orig = Image.open(up).convert("RGB")
-disp, scale = resize_for_canvas(orig, max_side=1280)
+disp, scale = resize_for_canvas(orig, max_side=800)  # Taille plus raisonnable
 W, H = disp.size
 
 st.image(disp, caption="Image d'entrée", use_column_width=True)
 
-# 2) Canvases avec l'image PIL (pas numpy)
+# 2) Canvases avec l'image convertie en base64
 st.subheader("Exemples utilisateur")
+
+# Convertir l'image en base64 pour le canvas
+bg_image = pil_to_base64(disp)
+
 cpos, cneg = st.columns(2)
 with cpos:
     st.caption("Traits OBJET (VERT) — peins sur 3 items (ou plus)")
     can_pos = st_canvas(
         fill_color="rgba(0,0,0,0)",
-        stroke_width=10,
+        stroke_width=8,
         stroke_color="#00FF00",
-        background_image=disp,           # <-- PIL Image
+        background_image=bg_image,        # Image en base64
         update_streamlit=True,
         height=H, width=W,
         drawing_mode="freedraw",
@@ -149,9 +160,9 @@ with cneg:
     st.caption("Traits FOND (ROUGE) — optionnel")
     can_neg = st_canvas(
         fill_color="rgba(0,0,0,0)",
-        stroke_width=10,
+        stroke_width=8,
         stroke_color="#FF0000",
-        background_image=disp,           # <-- PIL Image
+        background_image=bg_image,        # Image en base64
         update_streamlit=True,
         height=H, width=W,
         drawing_mode="freedraw",
@@ -161,23 +172,37 @@ with cneg:
 pos_mask = mask_from_strokes(can_pos.json_data, H, W)
 neg_mask = mask_from_strokes(can_neg.json_data, H, W)
 
+# Debug: Afficher si des traits ont été détectés
+if np.sum(pos_mask) > 0:
+    st.success(f"✅ Traits verts détectés ({np.sum(pos_mask > 0)} pixels)")
+if np.sum(neg_mask) > 0:
+    st.info(f"ℹ️ Traits rouges détectés ({np.sum(neg_mask > 0)} pixels)")
+
 # 3) Comptage
 if st.button("🚀 Compter"):
-    t0 = time.time()
-    img_cv = pil_to_cv(disp)
-    mask = segment_from_seeds(
-        img_cv, pos_mask, neg_mask,
-        thr_factor=thr_factor, pos_bias=pos_bias,
-        open_ksize=open_ksize, close_ksize=close_ksize
-    )
-    points_auto = count_from_mask(mask, min_area=min_area, max_area=max_area)
-    overlay_auto = overlay_points_pil(disp, points_auto, (0,255,0), radius=6)
-    st.session_state["disp"] = disp
-    st.session_state["points_auto"] = points_auto
-    st.session_state["overlay_auto"] = overlay_auto
-    st.success(f"Compte auto: {len(points_auto)}")
-    st.caption(f"Temps de traitement ~ {(time.time()-t0)*1000:.0f} ms")
-    st.image(overlay_auto, caption="Overlay comptage automatique", use_column_width=True)
+    if np.sum(pos_mask) == 0:
+        st.error("❌ Aucun trait vert détecté ! Dessine d'abord sur quelques objets.")
+    else:
+        t0 = time.time()
+        img_cv = pil_to_cv(disp)
+        mask = segment_from_seeds(
+            img_cv, pos_mask, neg_mask,
+            thr_factor=thr_factor, pos_bias=pos_bias,
+            open_ksize=open_ksize, close_ksize=close_ksize
+        )
+        points_auto = count_from_mask(mask, min_area=min_area, max_area=max_area)
+        overlay_auto = overlay_points_pil(disp, points_auto, (0,255,0), radius=6)
+        
+        # Sauvegarder dans session state
+        st.session_state["disp"] = disp
+        st.session_state["points_auto"] = points_auto
+        st.session_state["overlay_auto"] = overlay_auto
+        st.session_state["orig"] = orig
+        st.session_state["scale"] = scale
+        
+        st.success(f"Compte auto: {len(points_auto)}")
+        st.caption(f"Temps de traitement ~ {(time.time()-t0)*1000:.0f} ms")
+        st.image(overlay_auto, caption="Overlay comptage automatique", use_column_width=True)
 
 # 4) Corrections
 if "points_auto" in st.session_state:
@@ -185,14 +210,18 @@ if "points_auto" in st.session_state:
     base_overlay = st.session_state["overlay_auto"]
 
     st.subheader("Corrections (option)")
+    
+    # Convertir l'overlay en base64 pour les canvas de correction
+    overlay_b64 = pil_to_base64(base_overlay)
+    
     ca, cb = st.columns(2)
     with ca:
         st.caption("Ajouter des points MANQUANTS (VERT) — dessine de petits cercles")
         can_add = st_canvas(
-            fill_color="rgba(0,0,0,0)",
-            stroke_width=12,
+            fill_color="rgba(0,255,0,0.3)",
+            stroke_width=2,
             stroke_color="#00FF00",
-            background_image=base_overlay,  # <-- PIL Image
+            background_image=overlay_b64,     # Overlay en base64
             update_streamlit=True,
             height=H, width=W,
             drawing_mode="circle",
@@ -201,10 +230,10 @@ if "points_auto" in st.session_state:
     with cb:
         st.caption("Supprimer des faux positifs (ROUGE) — dessine de petits cercles")
         can_rem = st_canvas(
-            fill_color="rgba(0,0,0,0)",
-            stroke_width=12,
+            fill_color="rgba(255,0,0,0.3)",
+            stroke_width=2,
             stroke_color="#FF0000",
-            background_image=base_overlay,  # <-- PIL Image
+            background_image=overlay_b64,     # Overlay en base64
             update_streamlit=True,
             height=H, width=W,
             drawing_mode="circle",
@@ -216,8 +245,8 @@ if "points_auto" in st.session_state:
         if not json_data or "objects" not in json_data: return pts
         for o in json_data["objects"]:
             if o.get("type")=="circle":
-                cx = int(o["left"] + o["rx"])
-                cy = int(o["top"]  + o["ry"])
+                cx = int(o["left"] + o.get("rx", o.get("radius", 0)))
+                cy = int(o["top"]  + o.get("ry", o.get("radius", 0)))
                 pts.append((cx,cy))
         return pts
 
@@ -237,21 +266,51 @@ if "points_auto" in st.session_state:
         return pts
 
     detected = apply_corrections(st.session_state["points_auto"], add_pts, rem_pts, rm_radius)
+    
+    # Redimensionner les points vers l'image originale si nécessaire
+    if st.session_state.get("scale", 1.0) != 1.0:
+        scale = st.session_state["scale"]
+        detected_orig = [(x/scale, y/scale) for x,y in detected]
+        final_overlay_orig = overlay_points_pil(st.session_state["orig"], detected_orig, (0,255,0), radius=int(6/scale))
+    else:
+        detected_orig = detected
+        final_overlay_orig = overlay_points_pil(disp, detected, (0,255,0), radius=6)
+    
     final_overlay = overlay_points_pil(disp, detected, (0,255,0), radius=6)
-    st.metric("Compte final", len(detected))
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Compte final", len(detected))
+        if add_pts:
+            st.success(f"➕ {len(add_pts)} ajouts")
+        if rem_pts:
+            st.warning(f"➖ {len(rem_pts)} suppressions")
+    with col2:
+        correction = len(detected) - len(st.session_state["points_auto"])
+        if correction != 0:
+            st.metric("Correction", f"{correction:+d}")
+    
     st.image(final_overlay, caption="Overlay final (après corrections)", use_column_width=True)
 
     # 5) Rapport simple
     st.subheader("Rapport simple")
     validated_name = st.text_input("Nom validé à afficher", value=st.session_state.get("validated_name",""))
+    
+    # Utiliser l'image originale pour l'export
     buf = io.BytesIO()
-    final_overlay.save(buf, format="PNG")
+    final_overlay_orig.save(buf, format="PNG")
     st.download_button("⬇️ Image annotée (PNG)", data=buf.getvalue(),
                        file_name=f"rapport_{validated_name or 'compte'}.png", mime="image/png")
+    
     df = pd.DataFrame([{
         "nom_valide": validated_name or "objet",
         "compte_final": len(detected),
-        "compte_auto": len(st.session_state['points_auto'])
+        "compte_auto": len(st.session_state['points_auto']),
+        "correction": len(detected) - len(st.session_state['points_auto']),
+        "fichier": up.name if up else "image.png"
     }])
     st.download_button("⬇️ Résumé (CSV)", data=df.to_csv(index=False).encode("utf-8"),
                        file_name=f"rapport_{validated_name or 'compte'}.csv", mime="text/csv")
+    
+    # Afficher le dataframe pour vérification
+    st.dataframe(df, use_container_width=True)
