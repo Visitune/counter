@@ -6,7 +6,11 @@ import pandas as pd
 from pathlib import Path
 import json, time
 
-from utils import draw_rois, pil_to_cv, cv_to_pil, apply_rois_mask, adaptive_preprocess, morph_cleanup, count_connected_components, overlay_points, make_heatmap_from_points
+from utils import (
+    draw_rois, pil_to_cv, cv_to_pil, apply_rois_mask,
+    adaptive_preprocess, morph_cleanup, count_connected_components,
+    overlay_points, make_heatmap_from_points
+)
 
 st.set_page_config(page_title="Comptage agrée — Basic (OpenCV)", layout="wide")
 
@@ -32,7 +36,7 @@ with st.sidebar:
         poste = st.text_input("Poste")
         operateur = st.text_input("Opérateur")
     with colB:
-        produit = st.selectbox("Produit", ["Crevettes cuites","Riz long A","Lentilles vertes","Autre"])
+        produit = st.selectbox("Produit", ["Crevettes cuites", "Riz long A", "Lentilles vertes", "Autre"])
         lot = st.text_input("Lot")
         fournisseur = st.text_input("Fournisseur")
         format_unite = st.text_input("Format unité (ex. pcs/kg)")
@@ -55,7 +59,7 @@ tab1, tab2, tab3 = st.tabs(["Comptage", "Contrôle qualité", "Journal & Export"
 
 # ===== Onglet 1: Comptage =====
 with tab1:
-    up = st.file_uploader("Dépose une image (JPG/PNG)", type=["jpg","jpeg","png"])
+    up = st.file_uploader("Dépose une image (JPG/PNG)", type=["jpg", "jpeg", "png"])
     if up:
         img = Image.open(up).convert("RGB")
     else:
@@ -63,7 +67,7 @@ with tab1:
 
     if img is not None:
         st.subheader("Image brute")
-        st.image(img, use_container_width=True)
+        st.image(img, use_column_width=True)
 
         rois = []
         st.markdown("**Dessine (optionnel) 2–5 boîtes exemplaires / zones à compter.**")
@@ -85,7 +89,7 @@ with tab1:
                     rois.append([int(x), int(y), int(x+w), int(y+h)])
         if rois:
             st.caption(f"{len(rois)} zone(s) dessinée(s).")
-            st.image(draw_rois(img, rois), caption="Zones d'intérêt", use_container_width=True)
+            st.image(draw_rois(img, rois), caption="Zones d'intérêt", use_column_width=True)
         else:
             st.info("Aucune zone dessinée — l’algorithme comptera sur toute l’image.")
 
@@ -99,7 +103,7 @@ with tab1:
 
             points = count_connected_components(bw, min_area=min_area, max_area=max_area)
             count = len(points)
-            overlay = overlay_points(img, points, color=(0,255,0), radius=4)
+            overlay = overlay_points(img, points, color=(0, 255, 0), radius=4)
             heatmap = make_heatmap_from_points(img, points, sigma=12)
 
             dt_ms = (time.time() - t0) * 1000
@@ -108,9 +112,9 @@ with tab1:
 
             col1, col2 = st.columns(2)
             with col1:
-                st.image(overlay, caption="Overlay détections", use_container_width=True)
+                st.image(overlay, caption="Overlay détections", use_column_width=True)
             with col2:
-                st.image(heatmap, caption="Heatmap", use_container_width=True)
+                st.image(heatmap, caption="Heatmap", use_column_width=True)
 
             st.session_state.last_result = dict(
                 fichier_image=getattr(up, "name", "upload.png"),
