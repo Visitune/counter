@@ -2,105 +2,100 @@
 
 import streamlit as st
 from PIL import Image
-import pandas as pd
+import torch
+from sentence_transformers import util
+import utils
 import io
 
-import utils
-
-# Importation de la librairie pour les clics sur image
 try:
     from streamlit_image_coordinates import streamlit_image_coordinates
 except ImportError:
-    st.error("Module `streamlit-image-coordinates` manquant. Veuillez l'ajouter à requirements.txt.")
+    st.error("Module `streamlit-image-coordinates` manquant.")
     st.stop()
 
-# ==================== Configuration de la Page ====================
-st.set_page_config(page_title="Comptage Assisté par IA", layout="wide")
-st.title("🧮 Comptage Assisté par Apprentissage Actif")
+st.set_page_config(page_title="Comptage Multi-Modal", layout="wide")
+st.title("💡 Comptage Multi-Modal Inspiré par COUNTGD")
 
-# ==================== Barre Latérale ====================
+# --- Barre Latérale ---
 with st.sidebar:
-    st.header("Paramètres")
-    produit = st.text_input("Nom du produit", "objet")
-    min_area = st.slider("Taille min objet (px²)", 10, 5000, 100)
-    max_area = st.slider("Taille max objet (px²)", 1000, 100000, 30000)
+    st.header("1. Paramètres")
+    min_area = st.slider("Taille min objet (px²)", 10, 1000, 100)
     selection_radius = st.slider("Rayon de clic (px)", 5, 50, 20)
+    st.info("Le modèle d'IA est chargé une seule fois au démarrage.")
 
-# ==================== Chargement & Détection Initiale (Étape 1) ====================
-st.subheader("Étape 1 : Charger une image")
-up = st.file_uploader("Déposez une image pour commencer", type=["jpg", "jpeg", "png"])
+# --- Chargement & Étape 1 & 2 : Détection et Embedding ---
+st.header("Étape 1 : Charger une image")
+up = st.file_uploader("Déposez une image", type=["jpg", "jpeg", "png"])
 
-if not up:
-    st.stop()
+if not up: st.stop()
 
-# Mise en cache de la détection initiale pour la performance
+# Charger le modèle d'IA
+model = utils.get_clip_model()
+
 @st.cache_data
-def get_initial_objects(_img_bytes, min_a, max_a):
+def process_image(_img_bytes, _model, min_a):
     img = Image.open(io.BytesIO(_img_bytes)).convert("RGB")
-    objects = utils.detect_candidate_objects(img, min_a, max_a)
-    return img, objects
+    candidates = utils.detect_and_embed_candidates(img, _model, min_a)
+    return img, candidates
 
-base_img, candidate_objects = get_initial_objects(up.getvalue(), min_area, max_area)
+base_img, candidates = process_image(up.getvalue(), model, min_area)
 
-# Initialiser ou réinitialiser l'état de la session si l'image ou les paramètres changent
-if "objects" not in st.session_state or st.session_state.get("image_name") != up.name:
-    st.session_state.objects = candidate_objects
+if 'objects' not in st.session_state or st.session_state.get('image_name') != up.name:
+    st.session_state.objects = candidates
     st.session_state.image_name = up.name
 
-# ==================== Interface Principale ====================
+# --- Interface Principale ---
 col1, col2 = st.columns([3, 1])
 
 with col2:
-    st.subheader("Étape 2 : Guider l'IA")
-    st.info("Cliquez sur l'image pour marquer quelques objets comme 'Bons' et d'autres comme 'Mauvais'.")
-    mode_guidage = st.radio("Action du clic :", ["✅ Marquer comme Bon", "❌ Marquer comme Mauvais"], key="guidage")
+    st.header("Étape 2 : Guider l'IA")
+    prompt_mode = st.radio("Méthode de guidage", ["Clic sur un exemple", "Description textuelle"])
 
-    st.subheader("Étape 3 : Lancer l'IA")
-    if st.button("🎯 Lancer l'apprentissage", type="primary", use_container_width=True):
-        updated_objects, message = utils.train_and_predict(st.session_state.objects)
-        st.session_state.objects = updated_objects
-        if "Veuillez" in message:
-            st.warning(message)
-        else:
-            st.success(message)
-        st.rerun()
+    target_embedding = None
 
-    st.subheader("Étape 4 : Corriger et Exporter")
-    mode_correction = st.checkbox("Activer le mode correction")
+    if prompt_mode == "Clic sur un exemple":
+        st.info("Cliquez sur un objet de référence dans l'image.")
+        # L'action se passe dans la colonne de l'image
+    else:
+        text_prompt = st.text_input("Que faut-il compter ?", "shrimp")
+        if text_prompt:
+            target_embedding = model.encode(text_prompt, convert_to_tensor=True)
+
+    st.header("Étape 3 : Ajuster & Compter")
+    similarity_threshold = st.slider("Seuil de similarité", 0.5, 1.0, 0.85, 0.01)
     
-    # Compteurs
-    confirmed = sum(1 for o in st.session_state.objects if o['status'] == 'confirmed')
-    rejected = sum(1 for o in st.session_state.objects if o['status'] == 'rejected')
-    proposed_good = sum(1 for o in st.session_state.objects if o['status'] == 'proposed_good')
-    final_count = confirmed + proposed_good
-
-    st.metric("Total Final Estimé", final_count)
-    st.write(f"Détails : {confirmed} manuels + {proposed_good} IA")
+    # --- Logique de comptage ---
+    final_count = 0
+    if 'target_embedding' in st.session_state and st.session_state.target_embedding is not None:
+        all_embeddings = torch.stack([obj['embedding'] for obj in st.session_state.objects])
+        cos_scores = util.cos_sim(st.session_state.target_embedding, all_embeddings)[0]
+        
+        for i, obj in enumerate(st.session_state.objects):
+            if cos_scores[i] > similarity_threshold:
+                obj['is_counted'] = True
+                final_count += 1
+            else:
+                obj['is_counted'] = False
     
-    # Export
-    df = pd.DataFrame([{"produit": produit, "total_final": final_count}])
-    st.download_button("⬇️ Exporter le résumé (CSV)", df.to_csv(index=False).encode('utf-8'),
-                       f"resume_{produit}.csv", "text/csv", use_container_width=True)
+    st.metric("Total Compté", final_count)
+    st.info("Le comptage est mis à jour en temps réel lorsque vous bougez le curseur.")
+
 
 with col1:
     img_display = utils.overlay_objects(base_img, st.session_state.objects)
     click = streamlit_image_coordinates(img_display, key="click_img")
 
-    if click:
-        idx, dist = utils.nearest_object_index(st.session_state.objects, click["x"], click["y"])
+    if click and prompt_mode == "Clic sur un exemple":
+        # Trouver l'objet cliqué
+        positions = np.array([(obj['cx'], obj['cy']) for obj in st.session_state.objects])
+        distances_sq = np.sum((positions - np.array([click["x"], click["y"]]))**2, axis=1)
+        idx = np.argmin(distances_sq)
         
-        if idx is not None and dist < selection_radius:
-            target_obj = st.session_state.objects[idx]
-            
-            # Logique de clic selon le mode
-            if mode_correction:
-                # En mode correction, on inverse les propositions de l'IA
-                if target_obj['status'] == 'proposed_good':
-                    target_obj['status'] = 'rejected'
-                elif target_obj['status'] == 'proposed_bad':
-                    target_obj['status'] = 'confirmed'
-            else:
-                # En mode guidage, on définit les exemples
-                target_obj['status'] = "confirmed" if "Bon" in mode_guidage else "rejected"
-            
+        if np.sqrt(distances_sq[idx]) < selection_radius:
+            # Définir l'embedding cible et le stocker en session
+            st.session_state.target_embedding = st.session_state.objects[idx]['embedding']
             st.rerun()
+
+    # Logique pour le mode texte
+    if prompt_mode == "Description textuelle":
+        st.session_state.target_embedding = target_embedding
