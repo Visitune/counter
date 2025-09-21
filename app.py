@@ -6,7 +6,7 @@ import torch
 from sentence_transformers import util
 import utils
 import io
-import numpy as np # <--- CETTE LIGNE A ÉTÉ AJOUTÉE
+import numpy as np
 
 try:
     from streamlit_image_coordinates import streamlit_image_coordinates
@@ -41,9 +41,12 @@ def process_image(_img_bytes, _model, min_a):
 
 base_img, candidates = process_image(up.getvalue(), model, min_area)
 
+# Initialisation de l'état de la session
 if 'objects' not in st.session_state or st.session_state.get('image_name') != up.name:
     st.session_state.objects = candidates
     st.session_state.image_name = up.name
+    # Très important : réinitialiser l'embedding cible si l'image change
+    st.session_state.target_embedding = None
 
 # --- Interface Principale ---
 col1, col2 = st.columns([3, 1])
@@ -52,23 +55,23 @@ with col2:
     st.header("Étape 2 : Guider l'IA")
     prompt_mode = st.radio("Méthode de guidage", ["Clic sur un exemple", "Description textuelle"])
 
-    target_embedding = None
-
-    if prompt_mode == "Clic sur un exemple":
-        st.info("Cliquez sur un objet de référence dans l'image.")
-        # L'action se passe dans la colonne de l'image
-    else:
+    # La logique de mise à jour de l'état est maintenant gérée directement ici
+    if prompt_mode == "Description textuelle":
         text_prompt = st.text_input("Que faut-il compter ?", "shrimp")
         if text_prompt:
-            target_embedding = model.encode(text_prompt, convert_to_tensor=True)
+            # Met à jour l'état de la session directement
+            st.session_state.target_embedding = model.encode(text_prompt, convert_to_tensor=True)
+        else:
+            # Si le texte est effacé, on réinitialise
+            st.session_state.target_embedding = None
 
     st.header("Étape 3 : Ajuster & Compter")
     similarity_threshold = st.slider("Seuil de similarité", 0.5, 1.0, 0.85, 0.01)
     
-    # --- Logique de comptage ---
     final_count = 0
+    # La logique de comptage ne fait que LIRE l'état de la session
     if 'target_embedding' in st.session_state and st.session_state.target_embedding is not None:
-        if st.session_state.objects: # S'assurer que la liste n'est pas vide
+        if st.session_state.objects:
             all_embeddings = torch.stack([obj['embedding'] for obj in st.session_state.objects])
             cos_scores = util.cos_sim(st.session_state.target_embedding, all_embeddings)[0]
             
@@ -78,7 +81,11 @@ with col2:
                     final_count += 1
                 else:
                     obj['is_counted'] = False
-    
+    else:
+        # Si aucun cible n'est défini, s'assurer que rien n'est compté
+        for obj in st.session_state.objects:
+            obj['is_counted'] = False
+
     st.metric("Total Compté", final_count)
     st.info("Le comptage est mis à jour en temps réel lorsque vous bougez le curseur.")
 
@@ -87,18 +94,14 @@ with col1:
     img_display = utils.overlay_objects(base_img, st.session_state.objects)
     click = streamlit_image_coordinates(img_display, key="click_img")
 
+    # La logique du clic met à jour l'état de la session directement
     if click and prompt_mode == "Clic sur un exemple":
-        # Trouver l'objet cliqué
-        if st.session_state.objects: # S'assurer que la liste n'est pas vide
+        if st.session_state.objects:
             positions = np.array([(obj['cx'], obj['cy']) for obj in st.session_state.objects])
             distances_sq = np.sum((positions - np.array([click["x"], click["y"]]))**2, axis=1)
             idx = np.argmin(distances_sq)
             
             if np.sqrt(distances_sq[idx]) < selection_radius:
-                # Définir l'embedding cible et le stocker en session
                 st.session_state.target_embedding = st.session_state.objects[idx]['embedding']
+                # On force le rechargement pour que la logique de comptage s'exécute
                 st.rerun()
-
-    # Logique pour le mode texte
-    if prompt_mode == "Description textuelle":
-        st.session_state.target_embedding = target_embedding
