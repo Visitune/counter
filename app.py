@@ -5,6 +5,7 @@ from PIL import Image
 import utils
 import io
 import numpy as np
+import cv2 
 
 try:
     from streamlit_image_coordinates import streamlit_image_coordinates
