@@ -3,12 +3,11 @@
 import numpy as np
 import cv2
 from PIL import Image
-from sentence_transformers import SentenceTransformer, util
+from sentence_transformers import SentenceTransformer
 import streamlit as st
 
 @st.cache_resource
 def get_clip_model():
-    """Charge le modèle CLIP une seule fois et le met en cache."""
     return SentenceTransformer('clip-ViT-B-32')
 
 def pil_to_cv(img_pil):
@@ -28,6 +27,7 @@ def suppress_duplicates(objects, radius_factor=2.0):
     if not objects: return []
     objects.sort(key=lambda o: o['area'], reverse=True)
     kept_objects = []
+    # ... (le reste de la fonction est inchangé)
     suppressed_indices = set()
     for i, obj1 in enumerate(objects):
         if i in suppressed_indices: continue
@@ -40,39 +40,51 @@ def suppress_duplicates(objects, radius_factor=2.0):
                 suppressed_indices.add(j)
     return kept_objects
 
-# LA FONCTION DE DÉTECTION ACCEPTE MAINTENANT LES PARAMÈTRES DE L'INTERFACE
-def detect_and_embed_candidates(img_pil, model, min_area=50, block_size=41, C_value=2, open_k=3):
+# NOUVELLE FONCTION CLÉ
+def calibrate_hsv_from_click(img_hsv, x, y, tolerance={'h': 15, 's': 60, 'v': 60}):
+    """Calcule la plage HSV optimale à partir d'un clic sur l'image."""
+    x, y = int(x), int(y)
+    
+    # Échantillonner une petite zone autour du clic pour plus de robustesse
+    patch = img_hsv[max(0, y-5):y+5, max(0, x-5):x+5]
+    mean_hsv = np.mean(patch, axis=(0, 1))
+    
+    h, s, v = mean_hsv[0], mean_hsv[1], mean_hsv[2]
+    
+    h_min = max(0, h - tolerance['h'])
+    h_max = min(179, h + tolerance['h'])
+    s_min = max(0, s - tolerance['s'])
+    s_max = min(255, s + tolerance['s'])
+    v_min = max(0, v - tolerance['v'])
+    v_max = min(255, v + tolerance['v'])
+    
+    return {'h_min': int(h_min), 'h_max': int(h_max), 's_min': int(s_min), 
+            's_max': int(s_max), 'v_min': int(v_min), 'v_max': int(v_max)}
+
+def detect_candidates_by_color(img_pil, model, min_area, hsv_params):
     img_cv = pil_to_cv(img_pil)
-    gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
-    
-    # Utilisation des paramètres dynamiques
-    bw = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                               cv2.THRESH_BINARY_INV, block_size | 1, C_value)
-    
-    if open_k > 0:
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_k, open_k))
-        bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, kernel)
-    
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(bw)
-    
+    img_hsv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2HSV)
+    lower = np.array([hsv_params['h_min'], hsv_params['s_min'], hsv_params['v_min']])
+    upper = np.array([hsv_params['h_max'], hsv_params['s_max'], hsv_params['v_max']])
+    mask = cv2.inRange(img_hsv, lower, upper)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    # ... (le reste de la fonction est inchangé)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     all_fragments = []
-    for i in range(1, num_labels):
-        area = stats[i, cv2.CC_STAT_AREA]
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
         if area >= min_area:
-            x, y, w, h = stats[i, cv2.CC_STAT_LEFT:cv2.CC_STAT_LEFT+4]
-            patch = img_pil.crop((x, y, x + w, y + h))
-            all_fragments.append({
-                "id": i, "cx": centroids[i][0], "cy": centroids[i][1],
-                "area": area, "patch": patch
-            })
-            
+            M = cv2.moments(cnt)
+            if M['m00'] > 0:
+                cx, cy = int(M['m10']/M['m00']), int(M['m01']/M['m00'])
+                x, y, w, h = cv2.boundingRect(cnt)
+                patch = img_pil.crop((x, y, x + w, y + h))
+                all_fragments.append({"cx": cx, "cy": cy, "area": area, "patch": patch})
     candidates = suppress_duplicates(all_fragments)
-    
     if candidates:
-        patches = [c['patch'] for c in candidates]
-        embeddings = model.encode(patches, convert_to_tensor=True, show_progress_bar=False)
+        embeddings = model.encode([c['patch'] for c in candidates], convert_to_tensor=True, show_progress_bar=False)
         for i, c in enumerate(candidates):
             c['embedding'] = embeddings[i]
             del c['patch']
-            
-    return candidates
+    return candidates, mask, img_hsv
