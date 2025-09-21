@@ -19,10 +19,12 @@ def cv_to_pil(img_cv):
 
 def get_cluster_colors(num_clusters):
     """Génère une liste de couleurs distinctes pour visualiser les clusters."""
+    if num_clusters == 0:
+        return []
     colors = []
     # Utiliser une roue chromatique HSV pour des couleurs bien distinctes
     for i in range(num_clusters):
-        hue = int(i * (180 / num_clusters))
+        hue = int(i * (180.0 / num_clusters))
         colors.append((hue, 255, 255))
     
     # Convertir les couleurs HSV en BGR pour OpenCV
@@ -33,13 +35,16 @@ def overlay_clustered_objects(image_pil, objects, selected_cluster_id=None):
     """Affiche les objets avec une couleur par cluster."""
     img = pil_to_cv(image_pil.copy())
     
-    cluster_ids = {obj['cluster_id'] for obj in objects if obj['cluster_id'] != -1}
+    cluster_ids = {obj.get('cluster_id') for obj in objects if obj.get('cluster_id') is not None}
+    if not cluster_ids:
+        return cv_to_pil(img)
+        
     colors = get_cluster_colors(len(cluster_ids))
     cluster_color_map = {cid: color for cid, color in zip(sorted(list(cluster_ids)), colors)}
 
     for obj in objects:
-        cid = obj['cluster_id']
-        if cid == -1: continue # Ignorer le bruit
+        cid = obj.get('cluster_id')
+        if cid is None: continue
 
         color = cluster_color_map.get(cid)
         radius = 10 if cid == selected_cluster_id else 6
@@ -52,10 +57,36 @@ def overlay_clustered_objects(image_pil, objects, selected_cluster_id=None):
         cv2.circle(img, (int(obj['cx']), int(obj['cy'])), radius, color, thickness, lineType=cv2.LINE_AA)
         
     return cv_to_pil(img)
+    
+# ===================================================================
+# LA FONCTION QUI MANQUAIT EST MAINTENANT INCLUSE CI-DESSOUS
+# ===================================================================
+def calibrate_hsv_from_click(img_hsv, x, y, tolerance={'h': 15, 's': 60, 'v': 60}):
+    """Calcule la plage HSV optimale à partir d'un clic sur l'image."""
+    x, y = int(x), int(y)
+    
+    # Échantillonner une petite zone autour du clic pour plus de robustesse
+    patch = img_hsv[max(0, y-5):y+5, max(0, x-5):x+5]
+    if patch.size == 0:
+        return None # Clic en dehors des limites
+        
+    mean_hsv = np.mean(patch, axis=(0, 1))
+    
+    h, s, v = mean_hsv[0], mean_hsv[1], mean_hsv[2]
+    
+    h_min = max(0, h - tolerance['h'])
+    h_max = min(179, h + tolerance['h'])
+    s_min = max(0, s - tolerance['s'])
+    s_max = min(255, s + tolerance['s'])
+    v_min = max(0, v - tolerance['v'])
+    v_max = min(255, v + tolerance['v'])
+    
+    return {'h_min': int(h_min), 'h_max': int(h_max), 's_min': int(s_min), 
+            's_max': int(s_max), 'v_min': int(v_min), 'v_max': int(v_max)}
 
 def cluster_objects(objects, n_clusters=5):
     """Regroupe les objets en clusters en fonction de leur embedding."""
-    if len(objects) < n_clusters:
+    if not objects or len(objects) < n_clusters:
         for i, obj in enumerate(objects):
             obj['cluster_id'] = i
         return objects
@@ -63,7 +94,7 @@ def cluster_objects(objects, n_clusters=5):
     embeddings = np.array([obj['embedding'].cpu() for obj in objects])
     
     # Utiliser KMeans pour un clustering rapide
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init='auto')
     kmeans.fit(embeddings)
     
     for i, obj in enumerate(objects):
