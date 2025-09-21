@@ -1,107 +1,75 @@
 # app.py
 
 import streamlit as st
-from PIL import Image
-import utils
-import io
+import cv2
 import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
+from PIL import Image
+import io
 
-try:
-    from streamlit_image_coordinates import streamlit_image_coordinates
-except ImportError:
-    st.error("Module `streamlit-image-coordinates` manquant.")
-    st.stop()
+st.set_page_config(page_title="Compteur d'Objets Interactif", layout="wide")
+st.title("🔬 Compteur d'Objets Interactif")
 
-st.set_page_config(page_title="Comptage par l'Exemple", layout="wide")
-st.title("🎯 Comptage par l'Exemple")
-
-# --- Initialisation de l'état ---
-if 'positive_examples' not in st.session_state:
-    st.session_state.positive_examples = []
-
-# --- Barre Latérale ---
+# --- Barre Latérale avec les Contrôles ---
 with st.sidebar:
-    st.header("Paramètres")
-    min_area = st.slider("Sensibilité de détection (px²)", 10, 1000, 150)
-    similarity_threshold = st.slider("Seuil de similarité", 0.50, 1.00, 0.90, 0.01)
+    st.header("1. Paramètres de Détection")
+    
+    # Rendre les paramètres du code original interactifs
+    blur_ksize = st.slider("Force du flou (impair)", 1, 15, 5, 2)
+    min_area = st.slider("Taille minimale de l'objet (px²)", 1, 500, 10)
+    
+    # Ajouter le contrôle pour l'inversion
+    st.header("2. Type d'Image")
+    invert = st.checkbox("Mes objets sont sombres sur un fond clair", help="Cochez cette case si vos objets (particules) sont plus sombres que le fond.")
 
 # --- Chargement de l'image ---
 st.header("Étape 1 : Charger une image")
-up = st.file_uploader("Déposez une image", type=["jpg", "jpeg", "png"])
+up = st.file_uploader("Déposez une image ici", type=["jpg", "jpeg", "png", "bmp", "tif"])
 
-if not up: st.stop()
+if not up:
+    st.info("Veuillez charger une image pour commencer.")
+    st.stop()
 
-model = utils.get_clip_model()
+# --- Traitement de l'Image ---
+# Convertir l'upload en image OpenCV
+image_pil = Image.open(up).convert("RGB")
+image = np.array(image_pil)
+image_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
 
-# --- DÉTECTION ET CACHE ---
-# Cette fonction ne s'exécute qu'une fois par image et par paramètre min_area
-@st.cache_data
-def run_detection(_img_bytes, _model, _min_area):
-    img = Image.open(io.BytesIO(_img_bytes)).convert("RGB")
-    objects = utils.detect_and_embed_candidates(img, _model, _min_area)
-    return img, objects
+# Appliquer la logique du script original
+gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+blur = cv2.GaussianBlur(gray, (blur_ksize, blur_ksize), 0)
+_, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-base_img, all_objects = run_detection(up.getvalue(), model, min_area)
+# Inverser si la case est cochée
+if invert:
+    thresh = cv2.bitwise_not(thresh)
 
-# Réinitialiser si l'image change
-if st.session_state.get('img_name') != up.name:
-    st.session_state.img_name = up.name
-    st.session_state.positive_examples = []
+# Trouver les contours
+contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-# --- Interface Principale ---
-col1, col2 = st.columns([2, 1])
+# Filtrer par taille
+particles = [cnt for cnt in contours if cv2.contourArea(cnt) > min_area]
 
-with col2:
-    st.header("Étape 2 : Guider l'IA")
-    st.info("Cliquez sur 2 ou 3 objets que vous souhaitez compter. Chaque clic ajoute un exemple.")
-    
-    num_examples = len(st.session_state.positive_examples)
-    st.write(f"**{num_examples}** exemple(s) sélectionné(s).")
-    
-    if st.button("Réinitialiser les exemples", use_container_width=True):
-        st.session_state.positive_examples = []
-        st.rerun()
+# Dessiner les contours sur une copie de l'image
+output = image_bgr.copy()
+cv2.drawContours(output, particles, -1, (0, 255, 0), 2)
 
-    # --- LOGIQUE DE COMPTAGE ---
-    final_count = 0
-    if num_examples > 0:
-        # Créer l'empreinte moyenne des exemples
-        example_embeddings = np.array([all_objects[i]['embedding'] for i in st.session_state.positive_examples])
-        target_embedding = np.mean(example_embeddings, axis=0).reshape(1, -1)
-        
-        # Comparer à tous les autres objets
-        all_embeddings = np.array([obj['embedding'] for obj in all_objects])
-        similarities = cosine_similarity(target_embedding, all_embeddings)[0]
-        
-        for i, obj in enumerate(all_objects):
-            if similarities[i] > similarity_threshold:
-                obj['is_counted'] = True
-            else:
-                obj['is_counted'] = False
-        final_count = sum(obj.get('is_counted', False) for obj in all_objects)
-    else:
-        # Si pas d'exemple, rien n'est compté
-        for obj in all_objects:
-            obj['is_counted'] = False
+# --- Affichage des Résultats ---
+st.header("Étape 2 : Analyser les résultats")
 
-    st.header("Étape 3 : Résultat")
-    st.metric("Total Compté", final_count)
+col1, col2, col3 = st.columns(3)
 
 with col1:
-    st.write(f"Détection initiale : **{len(all_objects)}** objets potentiels trouvés.")
-    
-    img_display = utils.overlay_objects(base_img, all_objects, st.session_state.positive_examples)
-    click = streamlit_image_coordinates(img_display, key="click_img")
+    st.subheader("Image Originale")
+    st.image(image_bgr, channels="BGR", use_column_width=True)
 
-    if click:
-        if all_objects:
-            positions = np.array([(obj['cx'], obj['cy']) for obj in all_objects])
-            dist_sq = np.sum((positions - np.array([click['x'], click['y']]))**2, axis=1)
-            
-            # Ajouter le point cliqué comme exemple s'il est assez proche
-            if np.min(dist_sq) < (30**2):
-                idx = np.argmin(dist_sq)
-                if idx not in st.session_state.positive_examples:
-                    st.session_state.positive_examples.append(idx)
-                    st.rerun()
+with col2:
+    st.subheader("Masque Binaire")
+    st.image(thresh, use_column_width=True)
+    st.info("C'est ce que 'voit' l'ordinateur. Les objets à compter doivent être en blanc.")
+
+with col3:
+    st.subheader("Résultat Final")
+    st.image(output, channels="BGR", use_column_width=True)
+    
+st.metric("Nombre d'objets détectés", len(particles))
