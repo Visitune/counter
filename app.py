@@ -11,14 +11,16 @@ st.title("🔬 Compteur d'Objets Avancé")
 # --- Barre Latérale avec les Contrôles ---
 with st.sidebar:
     st.header("1. Paramètres de Détection")
-    st.info("Utilisez ces paramètres pour isoler les objets.")
-    block_size = st.slider("Taille du voisinage (impair)", 11, 255, 115, 2)
-    C = st.slider("Sensibilité locale (C)", -20, 20, 2)
-    
+    st.info("Ajustez le seuil pour que les objets soient bien isolés du fond.")
+    # Remplacer le seuil adaptatif par un seuil global, beaucoup plus stable pour ce cas
+    global_threshold = st.slider("Seuil Global", 0, 255, 170)
+    invert = st.checkbox("Inverser le masque", value=True, help="Doit être coché pour les objets sombres sur fond clair.")
+
     st.header("2. Paramètres de Séparation")
-    st.info("Ajustez ce seuil pour bien séparer les objets.")
-    watershed_threshold = st.slider("Seuil de séparation", 0.1, 1.0, 0.5, 0.05)
-    min_area = st.slider("Taille minimale de l'objet (px²)", 10, 5000, 150)
+    st.info("Ajustez ce seuil pour bien séparer les objets qui se touchent.")
+    # Le seuil de distance est plus intuitif pour Watershed
+    dist_threshold = st.slider("Seuil de séparation des distances", 0.1, 1.0, 0.2, 0.01)
+    min_area = st.slider("Taille minimale de l'objet (px²)", 10, 5000, 100)
     
 # --- Chargement de l'image ---
 st.header("Étape 1 : Charger une image")
@@ -35,26 +37,28 @@ image_bgr = cv2.cvtColor(image_bgr, cv2.COLOR_RGB2BGR)
 
 gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
 
-# --- ÉTAPE 1: SEUIL ADAPTATIF POUR ISOLER LES OBJETS ---
-# Crée un masque binaire en se basant sur la luminosité locale
-thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                               cv2.THRESH_BINARY_INV, block_size, C)
+# --- ÉTAPE 1: SEUIL GLOBAL (PLUS FIABLE) ---
+# Crée un masque binaire : tout ce qui est plus sombre que le seuil devient noir
+_, thresh = cv2.threshold(gray, global_threshold, 255, cv2.THRESH_BINARY)
+# Inverser pour que nos objets sombres deviennent blancs sur fond noir
+if invert:
+    thresh = cv2.bitwise_not(thresh)
 
 # --- ÉTAPE 2: NETTOYAGE DU MASQUE ---
-# Enlever le bruit
+# Enlever le bruit blanc dans le fond
 kernel = np.ones((3,3), np.uint8)
 opening = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=2)
 
 # --- ÉTAPE 3: SÉPARATION AVEC WATERSHED ---
-# Arrière-plan certain
+# Arrière-plan certain (en dilatant un peu les objets)
 sure_bg = cv2.dilate(opening, kernel, iterations=3)
 
 # Premier-plan certain (les "coeurs" des objets)
 dist_transform = cv2.distanceTransform(opening, cv2.DIST_L2, 5)
-_, sure_fg = cv2.threshold(dist_transform, watershed_threshold * dist_transform.max(), 255, 0)
+_, sure_fg = cv2.threshold(dist_transform, dist_threshold * dist_transform.max(), 255, 0)
 sure_fg = np.uint8(sure_fg)
 
-# Région inconnue
+# Région inconnue (la différence)
 unknown = cv2.subtract(sure_bg, sure_fg)
 
 # Créer les marqueurs
@@ -91,9 +95,9 @@ with col1:
     st.image(image_bgr, channels="BGR", use_column_width='always')
 
 with col2:
-    st.subheader("Masque d'Isolation")
+    st.subheader("Masque pour la séparation")
     st.image(opening, use_column_width='always')
-    st.info("Les objets doivent être des formes blanches distinctes.")
+    st.info("Les objets à compter doivent être des formes blanches pleines.")
 
 with col3:
     st.subheader("Résultat Final")
