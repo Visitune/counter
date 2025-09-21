@@ -4,6 +4,7 @@ import numpy as np
 import cv2
 from PIL import Image
 from sentence_transformers import SentenceTransformer, util
+import streamlit as st  # <--- CETTE LIGNE A ÉTÉ AJOUTÉE
 
 # ================= Modèle d'IA (CLIP) =================
 @st.cache_resource
