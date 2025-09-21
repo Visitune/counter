@@ -6,6 +6,7 @@ import torch
 from sentence_transformers import util
 import utils
 import io
+import numpy as np # <--- CETTE LIGNE A ÉTÉ AJOUTÉE
 
 try:
     from streamlit_image_coordinates import streamlit_image_coordinates
@@ -67,15 +68,16 @@ with col2:
     # --- Logique de comptage ---
     final_count = 0
     if 'target_embedding' in st.session_state and st.session_state.target_embedding is not None:
-        all_embeddings = torch.stack([obj['embedding'] for obj in st.session_state.objects])
-        cos_scores = util.cos_sim(st.session_state.target_embedding, all_embeddings)[0]
-        
-        for i, obj in enumerate(st.session_state.objects):
-            if cos_scores[i] > similarity_threshold:
-                obj['is_counted'] = True
-                final_count += 1
-            else:
-                obj['is_counted'] = False
+        if st.session_state.objects: # S'assurer que la liste n'est pas vide
+            all_embeddings = torch.stack([obj['embedding'] for obj in st.session_state.objects])
+            cos_scores = util.cos_sim(st.session_state.target_embedding, all_embeddings)[0]
+            
+            for i, obj in enumerate(st.session_state.objects):
+                if cos_scores[i] > similarity_threshold:
+                    obj['is_counted'] = True
+                    final_count += 1
+                else:
+                    obj['is_counted'] = False
     
     st.metric("Total Compté", final_count)
     st.info("Le comptage est mis à jour en temps réel lorsque vous bougez le curseur.")
@@ -87,14 +89,15 @@ with col1:
 
     if click and prompt_mode == "Clic sur un exemple":
         # Trouver l'objet cliqué
-        positions = np.array([(obj['cx'], obj['cy']) for obj in st.session_state.objects])
-        distances_sq = np.sum((positions - np.array([click["x"], click["y"]]))**2, axis=1)
-        idx = np.argmin(distances_sq)
-        
-        if np.sqrt(distances_sq[idx]) < selection_radius:
-            # Définir l'embedding cible et le stocker en session
-            st.session_state.target_embedding = st.session_state.objects[idx]['embedding']
-            st.rerun()
+        if st.session_state.objects: # S'assurer que la liste n'est pas vide
+            positions = np.array([(obj['cx'], obj['cy']) for obj in st.session_state.objects])
+            distances_sq = np.sum((positions - np.array([click["x"], click["y"]]))**2, axis=1)
+            idx = np.argmin(distances_sq)
+            
+            if np.sqrt(distances_sq[idx]) < selection_radius:
+                # Définir l'embedding cible et le stocker en session
+                st.session_state.target_embedding = st.session_state.objects[idx]['embedding']
+                st.rerun()
 
     # Logique pour le mode texte
     if prompt_mode == "Description textuelle":
